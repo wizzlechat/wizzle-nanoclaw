@@ -1,0 +1,104 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
+import type { SessionState } from '../../wizzle-protocol/src/index.ts';
+
+export type StoredPairing = {
+  relay: string;
+  pairingId: string;
+  secret: string;
+  name?: string;
+  runtime?: string;
+  createdAt: string;
+  pairedAt?: string;
+};
+
+function readJson<T>(file: string): T | null {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8')) as T;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+// Written to a sibling temp file and renamed so a crash never leaves a torn file.
+function writeText(file: string, text: string): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, text, { mode: 0o600 });
+  fs.chmodSync(tmp, 0o600);
+  fs.renameSync(tmp, file);
+}
+
+function writeJson(file: string, value: unknown): void {
+  writeText(file, `${JSON.stringify(value)}\n`);
+}
+
+function removeFile(file: string): void {
+  try {
+    fs.unlinkSync(file);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+}
+
+// Pairing secret, session counters, and the pending invite for one bridge, under the runtime's data dir.
+export class BridgeStore {
+  readonly dir: string;
+
+  constructor(dir: string) {
+    this.dir = dir;
+  }
+
+  private get pairingFile(): string {
+    return path.join(this.dir, 'pairing.json');
+  }
+
+  private get sessionFile(): string {
+    return path.join(this.dir, 'session.json');
+  }
+
+  get inviteFile(): string {
+    return path.join(this.dir, 'invite.txt');
+  }
+
+  loadPairing(): StoredPairing | null {
+    const stored = readJson<StoredPairing>(this.pairingFile);
+    if (!stored || typeof stored.pairingId !== 'string' || typeof stored.secret !== 'string') return null;
+    return stored;
+  }
+
+  savePairing(pairing: StoredPairing): void {
+    writeJson(this.pairingFile, pairing);
+  }
+
+  markPaired(): void {
+    const pairing = this.loadPairing();
+    if (!pairing || pairing.pairedAt) return;
+    this.savePairing({ ...pairing, pairedAt: new Date().toISOString() });
+  }
+
+  loadSession(): SessionState | null {
+    const state = readJson<SessionState>(this.sessionFile);
+    if (!state || !Array.isArray(state.epochs)) return null;
+    return state;
+  }
+
+  saveSession(state: SessionState): void {
+    writeJson(this.sessionFile, state);
+  }
+
+  // The invite (QR plus URL) stays on disk until the phone pairs, so setup can show it.
+  saveInvite(text: string): void {
+    writeText(this.inviteFile, text);
+  }
+
+  clearInvite(): void {
+    removeFile(this.inviteFile);
+  }
+
+  clear(): void {
+    for (const file of [this.pairingFile, this.sessionFile, this.inviteFile]) removeFile(file);
+  }
+}

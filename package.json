@@ -1,0 +1,14 @@
+{
+  "name": "wizzle-nanoclaw",
+  "version": "0.1.0",
+  "description": "NanoClaw channel adapter that bridges agents to the wizzle phone app through the relay",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
