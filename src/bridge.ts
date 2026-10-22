@@ -16,6 +16,7 @@ import {
   type Packet,
   type QuestionOption,
   type SessionState,
+  type TemplateInfo,
 } from '../../wizzle-protocol/src/index.ts';
 import { RelayClient, type Logger } from './relay-client.ts';
 import type { Transport } from './transport.ts';
@@ -31,6 +32,10 @@ const UPLOAD_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_HISTORY = 50;
 const MAX_HISTORY = 200;
 const MAX_TITLE_CHARS = 60;
+const MAX_PURPOSE_CHARS = 4000;
+const MSG_ID = /^[A-Za-z0-9_-]{1,64}$/;
+// NanoClaw refreshes typing every 4 seconds while the agent works; this long without one means it stopped.
+const ACTIVITY_SILENCE_MS = 12_000;
 
 export type HostAgent = { id: string; name: string; conv: string; status: Agent['status']; model?: string; description?: string; lastAt?: number };
 export type HostHistory = { messages: ChatMessage[]; hasMore: boolean };
@@ -38,6 +43,8 @@ export type HostActivity = { running: boolean; tool?: string; toolStartedAt?: nu
 export type HostQuestion = { title: string; question?: string; options: QuestionOption[] };
 export type HostConversation = { conv: string; agentId: string; title: string; lastAt?: number; topic: boolean; createdAt?: number };
 export type HostDeleted = { questionIds?: string[] };
+// Everything the phone can put in one create_agent, already validated by the bridge.
+export type HostCreateAgent = { name: string; purpose?: string; template?: string; copyFrom?: string; timezone?: string };
 
 // What the bridge needs from the runtime. The NanoClaw adapter implements it on the host DB.
 export interface BridgeHost {
@@ -48,15 +55,22 @@ export interface BridgeHost {
   history(conv: string, limit: number): Promise<HostHistory>;
   activity(conv: string): Promise<HostActivity>;
   questionRender(questionId: string): Promise<HostQuestion | undefined>;
-  createAgent?(name: string, description?: string): Promise<HostAgent>;
+  createAgent?(request: HostCreateAgent): Promise<HostAgent>;
+  listTemplates?(): Promise<TemplateInfo[]>;
   listConversations?(): Promise<HostConversation[]>;
   createConversation?(agentId: string, title: string): Promise<HostConversation>;
   renameConversation?(conv: string, title: string): Promise<HostConversation>;
   deleteConversation?(conv: string): Promise<HostDeleted | void>;
+  // Pause answers with the open questions it cancelled, so the phone can close them.
+  pauseAgent?(agentId: string): Promise<HostDeleted | void>;
+  resumeAgent?(agentId: string): Promise<void>;
+  restartAgent?(agentId: string, message?: string): Promise<void>;
+  deleteAgent?(agentId: string, removeWorkspace: boolean): Promise<HostDeleted | void>;
 }
 
 export type InboundAttachment = { name: string; mimeType: string; size: number; data: string };
-export type InboundText = { id: string; text: string; attachments?: InboundAttachment[] };
+// msgId is the phone's own id for the message, kept so history can hand it back.
+export type InboundText = { id: string; msgId: string; text: string; attachments?: InboundAttachment[] };
 
 // Callbacks into the runtime's inbound path, filled in by the adapter's setup().
 export type BridgeHooks = {
@@ -65,17 +79,20 @@ export type BridgeHooks = {
 };
 
 export type OutboundFile = { filename: string; data: Uint8Array };
-export type Outbound = { kind: string; content: unknown; files?: OutboundFile[] };
+// id is the runtime's own id for the message; it becomes the msgId so history and live rows match.
+export type Outbound = { kind: string; content: unknown; files?: OutboundFile[]; id?: string };
 
 export type PairingLink = {
   id: string;
   relayUrl: string;
   pairingId: Uint8Array;
   relaySecret: Uint8Array;
+  pairedSecret?(): Uint8Array | null;
   session: Session;
   transport: Transport;
   persist(state: SessionState): void;
   onPaired?(): void;
+  onFatal?(code: string, message: string): void;
   reconnect?: { minMs: number; maxMs: number };
 };
 
@@ -114,6 +131,7 @@ export class WizzleBridge {
   private readonly links = new Map<string, Link>();
   private readonly awaiting = new Set<string>();
   private readonly lastActivity = new Map<string, string>();
+  private readonly silence = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly questionConv = new Map<string, string>();
   private agents: HostAgent[] = [];
   private convs: HostConversation[] = [];
@@ -133,11 +151,17 @@ export class WizzleBridge {
       clearSession: false,
       abort: false,
       createAgent: typeof opts.host.createAgent === 'function',
+      templates: typeof opts.host.listTemplates === 'function',
       topics:
         typeof opts.host.listConversations === 'function' &&
         typeof opts.host.createConversation === 'function' &&
         typeof opts.host.renameConversation === 'function' &&
         typeof opts.host.deleteConversation === 'function',
+      lifecycle:
+        typeof opts.host.pauseAgent === 'function' &&
+        typeof opts.host.resumeAgent === 'function' &&
+        typeof opts.host.restartAgent === 'function',
+      deleteAgent: typeof opts.host.deleteAgent === 'function',
       ...opts.capabilities,
     };
   }
@@ -159,7 +183,9 @@ export class WizzleBridge {
       },
       onFatal: (code: string, message: string) => {
         this.log.error('wizzle: pairing disabled by relay', { pairing: pairing.id, code, message });
+        pairing.onFatal?.(code, message);
       },
+      ...(pairing.pairedSecret && { pairedSecret: pairing.pairedSecret }),
       ...(pairing.onPaired && { onPaired: pairing.onPaired }),
       ...(pairing.reconnect && { reconnect: pairing.reconnect }),
     };
@@ -167,6 +193,15 @@ export class WizzleBridge {
     this.links.set(pairing.id, link);
     if (this.hooks) link.client.start();
     return link.client;
+  }
+
+  // With revoke the relay forgets the pairing and the phone is cut off; without it only this side stops.
+  removePairing(id: string, revoke: boolean): void {
+    const link = this.links.get(id);
+    if (!link) return;
+    this.links.delete(id);
+    if (revoke) link.client.revoke();
+    else link.client.stop();
   }
 
   start(hooks: BridgeHooks): void {
@@ -195,13 +230,16 @@ export class WizzleBridge {
     const at = Date.now();
     const content = message.content;
     let firstId: string | undefined;
+    let wake = false;
     const emit = (packet: BridgeMessage, body?: Uint8Array) => {
       const id = randomUUID();
       this.broadcast({ ...packet, id } as Packet<BridgeMessage>, body);
+      if (packet.t === 'message' || packet.t === 'card' || packet.t === 'file') wake = true;
       return id;
     };
     const finishTurn = () => {
       this.awaiting.delete(conv);
+      this.clearSilence(conv);
       this.sendActivity({ conv, state: 'idle' });
     };
 
@@ -220,6 +258,7 @@ export class WizzleBridge {
       this.questionConv.set(questionId, conv);
       emit({ t: 'question', question });
       finishTurn();
+      this.wakePhone();
       return questionId;
     }
 
@@ -246,34 +285,47 @@ export class WizzleBridge {
 
     if (isRecord(content) && content.card !== undefined) {
       const fallbackText = typeof content.fallbackText === 'string' ? content.fallbackText : '';
-      const msgId = randomUUID();
+      const msgId = message.id ?? randomUUID();
       emit({ t: 'card', conv, msgId, card: content.card, fallbackText, at });
       firstId ??= msgId;
     } else {
       const text = extractText(content);
       if (text !== null && text.length > 0) {
-        const msgId = randomUUID();
+        const msgId = message.id ?? randomUUID();
         emit({ t: 'message', message: { conv, msgId, role: 'agent', text, format: 'markdown', at } });
         firstId ??= msgId;
       }
     }
 
-    for (const file of message.files ?? []) {
+    (message.files ?? []).forEach((file, index) => {
       if (file.data.length > MAX_FILE_BYTES) {
         emit({
           t: 'message',
           message: { conv, msgId: randomUUID(), role: 'system', text: `Attachment ${file.filename} skipped: larger than 16 MiB.`, format: 'text', at },
         });
-        continue;
+        return;
       }
-      const msgId = randomUUID();
+      const msgId = message.id !== undefined ? `${message.id}:f${index}` : randomUUID();
       const meta: FileMeta = { name: file.filename, mime: mimeFor(file.filename), size: file.data.length };
       emit({ t: 'file', conv, msgId, file: meta, at }, file.data);
       firstId ??= msgId;
-    }
+    });
 
     if (firstId !== undefined) finishTurn();
+    if (wake) this.wakePhone();
     return firstId;
+  }
+
+  // A host authored line in one conversation. The phone shows it as a system row.
+  notify(conv: string, text: string): void {
+    const message: ChatMessage = { conv, msgId: randomUUID(), role: 'system', text, format: 'text', at: Date.now() };
+    this.broadcast({ t: 'message', message, id: randomUUID() });
+    this.wakePhone();
+  }
+
+  // One push request per link whose phone is away; the relay decides whether to push.
+  private wakePhone(): void {
+    for (const link of this.links.values()) if (!link.client.peerOnline) link.client.requestPush();
   }
 
   // Runtime typing signal. Only sent while a phone is online, and only when it changes.
@@ -281,6 +333,8 @@ export class WizzleBridge {
     if (!this.awaiting.has(conv) && statusKind !== 'agent') return;
     if (!this.peerOnline) return;
     const host = await this.host.activity(conv);
+    // The reply can be delivered during the read; a "thinking" sent after its idle would never clear.
+    if (!this.awaiting.has(conv) && statusKind !== 'agent') return;
     const activity: Activity = {
       conv,
       state: host.tool ? 'tool' : 'thinking',
@@ -290,14 +344,38 @@ export class WizzleBridge {
       ...(host.timeoutMs && { timeoutMs: host.timeoutMs }),
     };
     this.sendActivity(activity);
+    this.armSilence(conv);
   }
 
+  // Only an activity that reached a phone counts as sent, so a repeat after a reconnect is not swallowed.
   private sendActivity(activity: Activity): void {
+    if (!this.peerOnline) return;
     const key = JSON.stringify(activity);
     if (this.lastActivity.get(activity.conv) === key) return;
     this.lastActivity.set(activity.conv, key);
-    if (!this.peerOnline) return;
     this.broadcast({ ...activity_packet(activity), id: randomUUID() });
+  }
+
+  // A turn that ends without a reply (a reaction, an edit) sends no idle, so typing going quiet stands in for it.
+  private armSilence(conv: string): void {
+    this.clearSilence(conv);
+    const timer = setTimeout(() => {
+      this.silence.delete(conv);
+      this.sendActivity({ conv, state: 'idle' });
+    }, ACTIVITY_SILENCE_MS);
+    timer.unref?.();
+    this.silence.set(conv, timer);
+  }
+
+  private clearSilence(conv: string): void {
+    clearTimeout(this.silence.get(conv));
+    this.silence.delete(conv);
+  }
+
+  // A new turn, or the end of one, starts the conversation's activity over.
+  private resetActivity(conv: string): void {
+    this.lastActivity.delete(conv);
+    this.clearSilence(conv);
   }
 
   private broadcast(packet: Packet<BridgeMessage>, body?: Uint8Array): void {
@@ -385,11 +463,14 @@ export class WizzleBridge {
           capabilities: this.capabilities,
         });
         await this.sendCatalog(link);
-        for (const agent of this.agents) {
-          if (agent.status !== 'running') continue;
-          const host = await this.host.activity(agent.conv);
+        // Only a reply still pending is activity; a running container can sit idle for half an hour.
+        for (const conv of [...this.awaiting]) {
+          const host = await this.host.activity(conv);
           if (!host.running) continue;
-          this.reply(link, activity_packet({ conv: agent.conv, state: host.tool ? 'tool' : 'thinking', ...(host.tool && { tool: host.tool }) }));
+          const activity: Activity = { conv, state: host.tool ? 'tool' : 'thinking', ...(host.tool && { tool: host.tool }) };
+          this.reply(link, activity_packet(activity));
+          this.lastActivity.set(conv, JSON.stringify(activity));
+          this.armSilence(conv);
         }
         return;
       }
@@ -399,6 +480,10 @@ export class WizzleBridge {
         const msgId = header.msgId;
         if (typeof conv !== 'string' || typeof text !== 'string' || typeof msgId !== 'string') {
           this.fail(link, ref, 'bad_request', 'send needs conv, msgId, and text');
+          return;
+        }
+        if (!MSG_ID.test(msgId)) {
+          this.fail(link, ref, 'bad_request', 'msgId is 1 to 64 characters of letters, digits, _ or -');
           return;
         }
         if (text.length > MAX_TEXT_CHARS) {
@@ -411,6 +496,13 @@ export class WizzleBridge {
         }
         if (conv === SYSTEM_CONV) {
           this.fail(link, ref, 'read_only', 'No agent is wired to the System conversation');
+          return;
+        }
+        // Fresh, because the agent may have been paused from the host CLI since the last catalog.
+        const ownerId = this.convs.find((c) => c.conv === conv)?.agentId;
+        const owner = (await this.refreshAgents()).find((a) => a.id === ownerId);
+        if (owner?.status === 'paused') {
+          this.fail(link, ref, 'paused', `${owner.name} is paused. Resume it to send messages.`);
           return;
         }
         const attachments: InboundAttachment[] = [];
@@ -433,10 +525,10 @@ export class WizzleBridge {
           this.fail(link, ref, 'empty', 'Nothing to send');
           return;
         }
-        const message: InboundText = { id: `wizzle-${randomUUID()}`, text, ...(attachments.length > 0 && { attachments }) };
+        const message: InboundText = { id: `wizzle-${randomUUID()}`, msgId, text, ...(attachments.length > 0 && { attachments }) };
         hooks.onInbound(conv, message);
         this.awaiting.add(conv);
-        this.lastActivity.delete(conv);
+        this.resetActivity(conv);
         return;
       }
       case 'upload': {
@@ -495,18 +587,54 @@ export class WizzleBridge {
         return;
       }
       case 'create_agent': {
-        const name = header.name;
-        if (!this.host.createAgent || typeof name !== 'string' || name.trim().length === 0) {
+        if (!this.host.createAgent) {
           this.fail(link, ref, 'unsupported', 'Agent creation is not available');
           return;
         }
+        const name = typeof header.name === 'string' ? header.name.trim() : '';
+        if (name.length === 0) {
+          this.fail(link, ref, 'bad_request', 'create_agent needs a name');
+          return;
+        }
+        // `description` is what an older phone calls the purpose.
+        const rawPurpose = optionalText(header.purpose) ?? optionalText(header.description);
+        if (rawPurpose !== undefined && rawPurpose.length > MAX_PURPOSE_CHARS) {
+          this.fail(link, ref, 'too_long', `A purpose is at most ${MAX_PURPOSE_CHARS} characters`);
+          return;
+        }
+        const template = optionalText(header.template);
+        const copyFrom = optionalText(header.copyFrom);
+        if (template !== undefined && copyFrom !== undefined) {
+          this.fail(link, ref, 'bad_request', 'create_agent takes a template or a copyFrom, not both');
+          return;
+        }
+        const request: HostCreateAgent = {
+          name,
+          ...(rawPurpose !== undefined && { purpose: rawPurpose }),
+          ...(template !== undefined && { template }),
+          ...(copyFrom !== undefined && { copyFrom }),
+          ...(optionalText(header.timezone) !== undefined && { timezone: optionalText(header.timezone) as string }),
+        };
         try {
-          const created = await this.host.createAgent(name.trim(), typeof header.description === 'string' ? header.description : undefined);
+          const created = await this.host.createAgent(request);
           this.reply(link, { t: 'agent', agent: toAgent(created) });
-          await this.sendCatalog(link);
+          await this.broadcastCatalog();
         } catch (err) {
           this.log.warn('wizzle: agent creation failed', { err });
-          this.fail(link, ref, 'create_failed', err instanceof Error ? err.message : 'Agent creation failed');
+          this.failHost(link, ref, err, 'create_failed', 'Agent creation failed');
+        }
+        return;
+      }
+      case 'templates': {
+        if (!this.host.listTemplates) {
+          this.fail(link, ref, 'unsupported', 'Templates are not available');
+          return;
+        }
+        try {
+          this.reply(link, { t: 'templates', templates: await this.host.listTemplates() });
+        } catch (err) {
+          this.log.warn('wizzle: listing templates failed', { err });
+          this.failHost(link, ref, err, 'create_failed', 'Templates could not be listed');
         }
         return;
       }
@@ -593,12 +721,69 @@ export class WizzleBridge {
             this.broadcast({ t: 'question_resolved', questionId, id: randomUUID() });
           }
           this.awaiting.delete(conv);
-          this.lastActivity.delete(conv);
+          this.resetActivity(conv);
           this.broadcast({ t: 'conversation_deleted', conv, id: randomUUID() });
           await this.broadcastCatalog();
         } catch (err) {
           this.log.warn('wizzle: topic delete failed', { err });
           this.failHost(link, ref, err, 'delete_failed', 'Topic delete failed');
+        }
+        return;
+      }
+      case 'pause_agent':
+      case 'resume_agent':
+      case 'restart_agent': {
+        const agent = await this.lifecycleTarget(link, ref, header.t, header.agentId);
+        if (!agent) return;
+        try {
+          if (header.t === 'pause_agent') {
+            const result = await this.host.pauseAgent?.(agent.id);
+            this.closeQuestions(result?.questionIds ?? []);
+            for (const c of this.convs) if (c.agentId === agent.id) this.settle(c.conv);
+          } else if (header.t === 'resume_agent') {
+            await this.host.resumeAgent?.(agent.id);
+          } else {
+            if (agent.status === 'paused') {
+              this.fail(link, ref, 'bad_request', `Resume ${agent.name} before restarting it`);
+              return;
+            }
+            const message = optionalText(header.message);
+            if (message !== undefined && message.length > MAX_TEXT_CHARS) {
+              this.fail(link, ref, 'too_long', `Messages are limited to ${MAX_TEXT_CHARS} characters`);
+              return;
+            }
+            await this.host.restartAgent?.(agent.id, message);
+          }
+          const fresh = (await this.refreshAgents()).find((a) => a.id === agent.id);
+          if (fresh) this.broadcast({ t: 'agent', agent: toAgent(fresh), id: randomUUID() });
+        } catch (err) {
+          this.log.warn('wizzle: agent lifecycle failed', { t: header.t, agentId: agent.id, err });
+          const fallback = header.t === 'restart_agent' ? 'restart_failed' : 'lifecycle_failed';
+          this.failHost(link, ref, err, fallback, `${agent.name} could not be changed`);
+        }
+        return;
+      }
+      case 'delete_agent': {
+        if (typeof header.removeWorkspace !== 'boolean') {
+          this.fail(link, ref, 'bad_request', 'delete_agent needs agentId and removeWorkspace');
+          return;
+        }
+        const agent = await this.lifecycleTarget(link, ref, header.t, header.agentId);
+        if (!agent) return;
+        try {
+          const result = await this.host.deleteAgent?.(agent.id, header.removeWorkspace);
+          this.closeQuestions(result?.questionIds ?? []);
+          for (const c of this.convs) if (c.agentId === agent.id) this.settle(c.conv);
+          for (const [questionId, conv] of this.questionConv) {
+            if (this.convs.some((c) => c.conv === conv && c.agentId === agent.id)) this.questionConv.delete(questionId);
+          }
+          this.convs = this.convs.filter((c) => c.agentId !== agent.id);
+          this.agents = this.agents.filter((a) => a.id !== agent.id);
+          this.broadcast({ t: 'agent_deleted', agentId: agent.id, id: randomUUID() });
+          await this.broadcastCatalog();
+        } catch (err) {
+          this.log.warn('wizzle: agent delete failed', { agentId: agent.id, err });
+          this.failHost(link, ref, err, 'delete_failed', `${agent.name} could not be deleted`);
         }
         return;
       }
@@ -613,11 +798,53 @@ export class WizzleBridge {
     }
   }
 
+  // Checks the capability and the agent for a lifecycle packet; answers the phone itself on a refusal.
+  private async lifecycleTarget(link: Link, ref: string | undefined, t: string, agentId: unknown): Promise<HostAgent | null> {
+    const methods: Record<string, unknown> = {
+      pause_agent: this.host.pauseAgent,
+      resume_agent: this.host.resumeAgent,
+      restart_agent: this.host.restartAgent,
+      delete_agent: this.host.deleteAgent,
+    };
+    const flag = t === 'delete_agent' ? this.capabilities.deleteAgent : this.capabilities.lifecycle;
+    if (!flag || typeof methods[t] !== 'function') {
+      this.fail(link, ref, 'unsupported', `${t} is not supported by this runtime`);
+      return null;
+    }
+    if (typeof agentId !== 'string' || agentId.length === 0) {
+      this.fail(link, ref, 'bad_request', `${t} needs agentId`);
+      return null;
+    }
+    if (agentId === SYSTEM_AGENT.id) {
+      this.fail(link, ref, 'bad_request', 'The System agent cannot be paused, restarted or deleted');
+      return null;
+    }
+    const agent = (await this.refreshAgents()).find((a) => a.id === agentId);
+    if (!agent) {
+      this.fail(link, ref, 'unknown_agent', 'No such agent');
+      return null;
+    }
+    return agent;
+  }
+
+  private closeQuestions(questionIds: string[]): void {
+    for (const questionId of questionIds) {
+      this.questionConv.delete(questionId);
+      this.broadcast({ t: 'question_resolved', questionId, id: randomUUID() });
+    }
+  }
+
+  // A stopped agent will not finish its turn, so the conversation stops waiting on it.
+  private settle(conv: string): void {
+    this.awaiting.delete(conv);
+    this.resetActivity(conv);
+  }
+
   private markAwaitingForQuestion(questionId: string): void {
     const conv = this.questionConv.get(questionId);
     if (!conv) return;
     this.awaiting.add(conv);
-    this.lastActivity.delete(conv);
+    this.resetActivity(conv);
   }
 
   private dropUpload(link: Link, uploadId: string): void {
@@ -631,6 +858,12 @@ export class WizzleBridge {
     const cutoff = Date.now() - UPLOAD_TTL_MS;
     for (const [id, upload] of link.uploads) if (upload.at < cutoff) this.dropUpload(link, id);
   }
+}
+
+function optionalText(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const text = value.trim();
+  return text.length > 0 ? text : undefined;
 }
 
 function activity_packet(activity: Activity): BridgeMessage {
