@@ -15,9 +15,11 @@ import {
   encodePacket,
   toB64Url,
   type DecodedPacket,
+  type KeyPair,
   type PhoneMessage,
   type RelayControl,
   type Role,
+  type SessionKeys,
   type SessionState,
 } from '../../wizzle-protocol/src/index.ts';
 import type { Logger } from '../src/relay-client.ts';
@@ -35,6 +37,10 @@ export class FakeRelay {
   private readonly buffered: Record<Role, Uint8Array[]> = { phone: [], bridge: [] };
   connections = 0;
   expectedSecret: string | null = null;
+  readonly hellos: string[] = [];
+  readonly rekeys: string[] = [];
+  revoked = 0;
+  wakes = 0;
   readonly transport: Transport = { connect: (_url, handlers) => this.connect(handlers) };
 
   online(role: Role): boolean {
@@ -77,7 +83,27 @@ export class FakeRelay {
 
   private onText(client: Client, text: string): void {
     const msg = decodeControl(text);
+    if (msg.t === 'rekey' && client.role === 'bridge') {
+      this.rekeys.push(msg.secret);
+      if (this.expectedSecret !== null) this.expectedSecret = msg.secret;
+      return;
+    }
+    if (msg.t === 'wake' && client.role === 'bridge') {
+      this.wakes += 1;
+      return;
+    }
+    if (msg.t === 'revoke' && client.role) {
+      this.revoked += 1;
+      const peer = this.clients.get(other(client.role));
+      if (peer) {
+        this.deliverText(peer, { t: 'error', code: 'revoked', message: 'pairing revoked' });
+        this.disconnect(peer, 4003, 'revoked');
+      }
+      this.disconnect(client, 1000, 'revoked');
+      return;
+    }
     if (msg.t !== 'hello') return;
+    this.hellos.push(msg.secret);
     if (msg.v !== RELAY_PROTOCOL_VERSION) {
       this.deliverText(client, { t: 'error', code: 'proto', message: 'unsupported version' });
       this.disconnect(client, 4002, 'proto');
@@ -146,11 +172,12 @@ export class FakePhone {
   private welcomeWaiter: (() => void) | null = null;
   private confirmWaiter: (() => void) | null = null;
 
-  constructor(relay: FakeRelay, pairingId: Uint8Array, secret: Uint8Array, state?: SessionState) {
+  constructor(relay: FakeRelay, pairing: TestPairing, state?: SessionState, own: KeyPair = pairing.phone) {
     this.relay = relay;
-    this.pairingId = pairingId;
-    this.relaySecret = deriveRelaySecret(nodeCrypto, secret);
-    this.session = new Session(nodeCrypto, 'phone', pairingId, derivePsk(nodeCrypto, secret), state);
+    this.pairingId = pairing.pairingId;
+    this.relaySecret = deriveRelaySecret(nodeCrypto, pairing.secret);
+    const keys = { psk: derivePsk(nodeCrypto, pairing.secret), own, peer: pairing.bridge.publicKey };
+    this.session = new Session(nodeCrypto, 'phone', pairing.pairingId, keys, state);
   }
 
   connect(): Promise<void> {
@@ -159,7 +186,7 @@ export class FakePhone {
       this.conn = this.relay.transport.connect('fake', {
         onOpen: () => {
           this.conn?.sendText(
-            encodeControl({ t: 'hello', v: 1, pairing: toB64Url(this.pairingId), role: 'phone', secret: toB64Url(this.relaySecret) }),
+            encodeControl({ t: 'hello', v: RELAY_PROTOCOL_VERSION, pairing: toB64Url(this.pairingId), role: 'phone', secret: toB64Url(this.relaySecret) }),
           );
         },
         onText: (text) => {
@@ -181,6 +208,10 @@ export class FakePhone {
   disconnect(): void {
     this.conn?.close();
     this.conn = null;
+  }
+
+  revoke(): void {
+    this.conn?.sendText(encodeControl({ t: 'revoke' }));
   }
 
   handshake(): Promise<void> {
@@ -256,6 +287,13 @@ export async function until(check: () => boolean, timeoutMs = 2000): Promise<voi
   }
 }
 
-export function newPairing(): { pairingId: Uint8Array; secret: Uint8Array } {
-  return { pairingId: nodeCrypto.randomBytes(16), secret: nodeCrypto.randomBytes(32) };
+export type TestPairing = { pairingId: Uint8Array; secret: Uint8Array; bridge: KeyPair; phone: KeyPair };
+
+export function newPairing(): TestPairing {
+  return { pairingId: nodeCrypto.randomBytes(16), secret: nodeCrypto.randomBytes(32), bridge: nodeCrypto.x25519KeyPair(), phone: nodeCrypto.x25519KeyPair() };
+}
+
+// The bridge side's session keys before a phone is pinned.
+export function bridgeKeys(pairing: TestPairing, pinned: Uint8Array | null = null): SessionKeys {
+  return { psk: derivePsk(nodeCrypto, pairing.secret), own: pairing.bridge, peer: pinned };
 }

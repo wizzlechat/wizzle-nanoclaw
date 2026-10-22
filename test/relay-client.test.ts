@@ -2,20 +2,28 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { nodeCrypto } from '../../wizzle-protocol/src/crypto-node.ts';
-import { Session, derivePsk, deriveRelaySecret, encodePacket, fromUtf8, type SessionState } from '../../wizzle-protocol/src/index.ts';
+import {
+  Session,
+  derivePairedRelaySecret,
+  deriveRelaySecret,
+  encodePacket,
+  fromUtf8,
+  toB64Url,
+  type SessionState,
+} from '../../wizzle-protocol/src/index.ts';
 import { RelayClient } from '../src/relay-client.ts';
-import { FakePhone, FakeRelay, collectingLog, newPairing, silentLog, until } from './fake-relay.ts';
+import { FakePhone, FakeRelay, bridgeKeys, collectingLog, newPairing, silentLog, until, type TestPairing } from './fake-relay.ts';
 
 function note(text: string): Uint8Array {
   return encodePacket({ id: text, t: 'message', message: { conv: 'c', msgId: text, role: 'agent', text, format: 'text', at: 1 } });
 }
 
-function bridgeClient(relay: FakeRelay, pairing: { pairingId: Uint8Array; secret: Uint8Array }, extra: Partial<ConstructorParameters<typeof RelayClient>[0]> = {}) {
+function bridgeClient(relay: FakeRelay, pairing: TestPairing, extra: Partial<ConstructorParameters<typeof RelayClient>[0]> = {}) {
   const states: SessionState[] = [];
   const packets: string[] = [];
   let paired = 0;
   const fatal: string[] = [];
-  const session = new Session(nodeCrypto, 'bridge', pairing.pairingId, derivePsk(nodeCrypto, pairing.secret));
+  const session = new Session(nodeCrypto, 'bridge', pairing.pairingId, bridgeKeys(pairing));
   const client = new RelayClient({
     transport: relay.transport,
     relayUrl: 'fake',
@@ -42,7 +50,7 @@ test('hello, handshake, and a round trip through the relay', async () => {
   assert.equal(bridge.session.ready, false);
   assert.equal(bridge.client.send(note('too early')), false);
 
-  const phone = new FakePhone(relay, pairing.pairingId, pairing.secret);
+  const phone = new FakePhone(relay, pairing);
   await phone.connect();
   await until(() => bridge.client.peerOnline);
   await phone.handshake();
@@ -66,7 +74,7 @@ test('persists the counter before a frame leaves', async () => {
   const bridge = bridgeClient(relay, pairing);
   bridge.client.start();
   await until(() => bridge.client.state === 'ready');
-  const phone = new FakePhone(relay, pairing.pairingId, pairing.secret);
+  const phone = new FakePhone(relay, pairing);
   await phone.connect();
   await phone.handshake();
   await until(() => bridge.session.ready);
@@ -89,7 +97,7 @@ test('resends unacked frames after a reconnect and stops once acked', async () =
   const bridge = bridgeClient(relay, pairing, { log });
   bridge.client.start();
   await until(() => bridge.client.state === 'ready');
-  const phone = new FakePhone(relay, pairing.pairingId, pairing.secret);
+  const phone = new FakePhone(relay, pairing);
   phone.autoAck = false;
   await phone.connect();
   await phone.handshake();
@@ -134,7 +142,7 @@ test('frames buffered by the relay while the phone is offline arrive on reconnec
   const bridge = bridgeClient(relay, pairing);
   bridge.client.start();
   await until(() => bridge.client.state === 'ready');
-  const phone = new FakePhone(relay, pairing.pairingId, pairing.secret);
+  const phone = new FakePhone(relay, pairing);
   await phone.connect();
   await phone.handshake();
   await until(() => bridge.session.ready);
@@ -145,12 +153,125 @@ test('frames buffered by the relay while the phone is offline arrive on reconnec
   await until(() => relay.bufferedFor('phone') === 2);
 
   const state = phone.session.exportState();
-  const again = new FakePhone(relay, pairing.pairingId, pairing.secret, state);
+  const again = new FakePhone(relay, pairing, state);
   await again.connect();
   await until(() => again.received.length === 2);
   assert.equal(relay.bufferedFor('phone'), 0);
   bridge.client.stop();
   again.disconnect();
+});
+
+test('wake goes to the relay only while the phone is offline, and waits for the next welcome when not attached', async () => {
+  const relay = new FakeRelay();
+  const pairing = newPairing();
+  const bridge = bridgeClient(relay, pairing);
+  bridge.client.start();
+  await until(() => bridge.client.state === 'ready');
+  const phone = new FakePhone(relay, pairing);
+  await phone.connect();
+  await phone.handshake();
+  await until(() => bridge.session.ready && bridge.client.peerOnline);
+
+  bridge.client.requestPush();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(relay.wakes, 0);
+
+  phone.disconnect();
+  await until(() => !bridge.client.peerOnline);
+  bridge.client.requestPush();
+  await until(() => relay.wakes === 1);
+
+  relay.drop('bridge');
+  await until(() => bridge.client.state === 'connecting');
+  bridge.client.requestPush();
+  assert.equal(relay.wakes, 1);
+  await until(() => bridge.client.state === 'ready');
+  await until(() => relay.wakes === 2);
+
+  relay.drop('bridge');
+  await until(() => bridge.client.state === 'connecting');
+  await until(() => bridge.client.state === 'ready');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(relay.wakes, 2);
+  bridge.client.stop();
+});
+
+test('a pending wake is dropped when the phone is back by the next welcome', async () => {
+  const relay = new FakeRelay();
+  const pairing = newPairing();
+  const bridge = bridgeClient(relay, pairing, { reconnect: { minMs: 40, maxMs: 40 } });
+  bridge.client.start();
+  await until(() => bridge.client.state === 'ready');
+  const phone = new FakePhone(relay, pairing);
+  await phone.connect();
+  await phone.handshake();
+  await until(() => bridge.session.ready);
+  phone.disconnect();
+  await until(() => !bridge.client.peerOnline);
+
+  relay.drop('bridge');
+  await until(() => bridge.client.state === 'connecting');
+  bridge.client.requestPush();
+  const again = new FakePhone(relay, pairing, phone.session.exportState());
+  await again.connect();
+  await until(() => bridge.client.state === 'ready' && bridge.client.peerOnline);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(relay.wakes, 0);
+  bridge.client.stop();
+  again.disconnect();
+});
+
+test('the outbox is resent when the phone comes back and the phone drops the repeat', async () => {
+  const relay = new FakeRelay();
+  const pairing = newPairing();
+  const bridge = bridgeClient(relay, pairing);
+  bridge.client.start();
+  await until(() => bridge.client.state === 'ready');
+  const phone = new FakePhone(relay, pairing);
+  phone.autoAck = false;
+  await phone.connect();
+  await phone.handshake();
+  await until(() => bridge.session.ready);
+  bridge.client.send(note('unacked'));
+  await until(() => phone.received.length === 1);
+  phone.disconnect();
+  await until(() => !bridge.client.peerOnline);
+
+  const again = new FakePhone(relay, pairing, phone.session.exportState());
+  await again.connect();
+  await until(() => bridge.client.peerOnline);
+  await until(() => again.dataFrames === 1);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(again.dataFrames, 1);
+  assert.equal(again.received.length, 0);
+  bridge.client.stop();
+  again.disconnect();
+});
+
+test('a replayed phone frame is dropped silently: no log, no new handshake', async () => {
+  const relay = new FakeRelay();
+  const pairing = newPairing();
+  const log = collectingLog();
+  const bridge = bridgeClient(relay, pairing, { log });
+  bridge.client.start();
+  await until(() => bridge.client.state === 'ready');
+  const phone = new FakePhone(relay, pairing);
+  await phone.connect();
+  await phone.handshake();
+  await until(() => bridge.session.ready && bridge.paired() === 1);
+  const before = log.lines.length;
+
+  const frame = phone.session.seal(encodePacket({ id: 'once', t: 'sync' }));
+  const conn = (phone as unknown as { conn: { sendBinary(b: Uint8Array): void } }).conn;
+  conn.sendBinary(frame);
+  await until(() => bridge.packets.length === 1);
+  conn.sendBinary(frame);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(bridge.packets.length, 1);
+  assert.equal(bridge.paired(), 1);
+  assert.equal(log.lines.length, before);
+  bridge.client.stop();
+  phone.disconnect();
 });
 
 test('an auth error from the relay stops the client for good', async () => {
@@ -164,4 +285,64 @@ test('an auth error from the relay stops the client for good', async () => {
   assert.equal(bridge.client.state, 'stopped');
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(relay.connections, 1);
+});
+
+function secrets(pairing: TestPairing) {
+  return {
+    invite: deriveRelaySecret(nodeCrypto, pairing.secret),
+    paired: derivePairedRelaySecret(nodeCrypto, pairing.pairingId, pairing.bridge.privateKey, pairing.phone.publicKey),
+  };
+}
+
+test('pinning a phone rotates the relay secret and later connects use the paired one', async () => {
+  const relay = new FakeRelay();
+  const pairing = newPairing();
+  const { invite, paired } = secrets(pairing);
+  relay.expectedSecret = toB64Url(invite);
+  let pinned = false;
+  const bridge = bridgeClient(relay, pairing, { pairedSecret: () => (pinned ? paired : null), onPaired: () => void (pinned = true) });
+  bridge.client.start();
+  await until(() => bridge.client.state === 'ready');
+  const phone = new FakePhone(relay, pairing);
+  await phone.connect();
+  await phone.handshake();
+  await until(() => relay.rekeys.length === 1);
+  assert.equal(relay.rekeys[0], toB64Url(paired));
+  assert.equal(relay.expectedSecret, toB64Url(paired));
+  relay.drop('bridge');
+  await until(() => relay.hellos.length === 3 && bridge.client.state === 'ready');
+  assert.deepEqual(relay.hellos, [toB64Url(invite), toB64Url(invite), toB64Url(paired)]);
+  assert.equal(relay.rekeys.length, 1);
+  assert.deepEqual(bridge.fatal, []);
+  bridge.client.stop();
+  phone.disconnect();
+});
+
+test('a relay that missed the rekey gets the invite secret once and the rekey again', async () => {
+  const relay = new FakeRelay();
+  const pairing = newPairing();
+  const { invite, paired } = secrets(pairing);
+  relay.expectedSecret = toB64Url(invite);
+  const bridge = bridgeClient(relay, pairing, { pairedSecret: () => paired });
+  bridge.client.start();
+  await until(() => bridge.client.state === 'ready' && relay.rekeys.length === 1);
+  assert.deepEqual(relay.hellos, [toB64Url(paired), toB64Url(invite)]);
+  assert.equal(relay.expectedSecret, toB64Url(paired));
+  assert.deepEqual(bridge.fatal, []);
+  bridge.client.stop();
+});
+
+test('revoke tells the relay, which cuts off the phone, and stops the client', async () => {
+  const relay = new FakeRelay();
+  const pairing = newPairing();
+  const bridge = bridgeClient(relay, pairing);
+  bridge.client.start();
+  await until(() => bridge.client.state === 'ready');
+  const phone = new FakePhone(relay, pairing);
+  await phone.connect();
+  await until(() => bridge.client.peerOnline);
+  bridge.client.revoke();
+  await until(() => phone.control.some((m) => m.t === 'error' && m.code === 'revoked'));
+  assert.equal(relay.revoked, 1);
+  assert.equal(bridge.client.state, 'stopped');
 });

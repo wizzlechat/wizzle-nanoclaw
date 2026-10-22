@@ -20,11 +20,13 @@ export type Logger = {
   error(msg: string, data?: Record<string, unknown>): void;
 };
 
+// relaySecret comes from the invite; pairedSecret, once a phone is pinned, replaces it at the relay.
 export type RelayClientOptions = {
   transport: Transport;
   relayUrl: string;
   pairingId: Uint8Array;
   relaySecret: Uint8Array;
+  pairedSecret?(): Uint8Array | null;
   session: Session;
   persist(state: SessionState): void;
   log: Logger;
@@ -50,6 +52,11 @@ export class RelayClient {
   private attempts = 0;
   private outbox: Pending[] = [];
   private outboxBytes = 0;
+  private secretIndex = 0;
+  private authRetry = false;
+  private trying: Uint8Array | null = null;
+  private attachedWith: Uint8Array | null = null;
+  private pushPending = false;
   state: RelayClientState = 'stopped';
   peerOnline = false;
 
@@ -64,6 +71,12 @@ export class RelayClient {
   start(): void {
     if (this.state !== 'stopped') return;
     this.connect();
+  }
+
+  // Tells the relay to forget the pairing, which also cuts off the phone, then stops.
+  revoke(): void {
+    if (this.state === 'ready') this.conn?.sendText(encodeControl({ t: 'revoke' }));
+    this.stop();
   }
 
   stop(): void {
@@ -96,9 +109,30 @@ export class RelayClient {
     return true;
   }
 
+  // Asks the relay to push the phone while it is offline. Not attached: held until the next welcome.
+  requestPush(): void {
+    if (this.state !== 'ready') {
+      this.pushPending = true;
+      return;
+    }
+    this.pushPending = false;
+    if (this.peerOnline) return;
+    this.conn?.sendText(encodeControl({ t: 'wake' }));
+  }
+
+  // Paired secret first; the invite secret covers a relay that has not taken the rekey yet.
+  private secrets(): Uint8Array[] {
+    const paired = this.opts.pairedSecret?.() ?? null;
+    return paired ? [paired, this.opts.relaySecret] : [this.opts.relaySecret];
+  }
+
   private connect(): void {
     this.state = 'connecting';
     this.peerOnline = false;
+    const secrets = this.secrets();
+    const secret = secrets[Math.min(this.secretIndex, secrets.length - 1)] as Uint8Array;
+    this.trying = secret;
+    this.attachedWith = null;
     let conn: TransportConn | null = null;
     conn = this.opts.transport.connect(this.opts.relayUrl, {
       onOpen: () => {
@@ -110,7 +144,7 @@ export class RelayClient {
             v: RELAY_PROTOCOL_VERSION,
             pairing: toB64Url(this.opts.pairingId),
             role: 'bridge',
-            secret: toB64Url(this.opts.relaySecret),
+            secret: toB64Url(secret),
           }),
         );
       },
@@ -126,6 +160,12 @@ export class RelayClient {
         this.peerOnline = false;
         this.opts.onPeer?.(false);
         if (this.state === 'stopped') return;
+        if (this.authRetry) {
+          this.authRetry = false;
+          this.connect();
+          return;
+        }
+        this.secretIndex = 0;
         this.opts.log.warn('wizzle: relay connection closed', { code, reason });
         this.scheduleReconnect();
       },
@@ -158,15 +198,25 @@ export class RelayClient {
         this.state = 'ready';
         this.attempts = 0;
         this.peerOnline = msg.peer;
+        this.attachedWith = this.trying;
         this.opts.log.info('wizzle: relay ready', { peer: msg.peer, buffered: msg.buffered });
-        for (const pending of this.outbox) this.conn?.sendBinary(pending.bytes);
+        this.rekey();
+        this.resendOutbox();
+        if (this.pushPending) this.requestPush();
         this.opts.onPeer?.(msg.peer);
         return;
       case 'peer':
         this.peerOnline = msg.online;
+        if (msg.online) this.resendOutbox();
         this.opts.onPeer?.(msg.online);
         return;
       case 'error':
+        if (msg.code === 'auth' && this.secretIndex + 1 < this.secrets().length) {
+          this.secretIndex += 1;
+          this.authRetry = true;
+          this.opts.log.info('wizzle: relay has not taken the paired secret yet, retrying with the invite secret');
+          return;
+        }
         this.opts.log.error('wizzle: relay error', { code: msg.code, message: msg.message });
         if (msg.code === 'auth' || msg.code === 'revoked') {
           this.stop();
@@ -217,6 +267,7 @@ export class RelayClient {
         this.sendAck();
         this.opts.log.info('wizzle: phone session established');
         this.opts.onPaired?.();
+        this.rekey();
         return;
       case 'duplicate':
         this.sendAck();
@@ -230,6 +281,20 @@ export class RelayClient {
       default:
         return;
     }
+  }
+
+  // Retires the invite secret at the relay once a phone is pinned, so a leaked invite cannot attach anymore.
+  private rekey(): void {
+    const target = this.opts.pairedSecret?.() ?? null;
+    if (!target || this.state !== 'ready' || !this.attachedWith || equal(target, this.attachedWith)) return;
+    this.conn?.sendText(encodeControl({ t: 'rekey', secret: toB64Url(target) }));
+    this.attachedWith = target;
+    this.opts.log.info('wizzle: relay secret rotated to the paired one');
+  }
+
+  // Unacked frames go again after a welcome and when the phone comes back; the receiver drops repeats.
+  private resendOutbox(): void {
+    for (const pending of this.outbox) this.conn?.sendBinary(pending.bytes);
   }
 
   private sendAck(): void {
