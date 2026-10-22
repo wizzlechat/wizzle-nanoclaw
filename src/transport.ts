@@ -21,20 +21,27 @@ export const webSocketTransport: Transport = {
   connect(url, handlers) {
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
+    let opened = false;
     let closed = false;
-    ws.addEventListener('open', () => handlers.onOpen());
+    const finish = (code: number, reason: string) => {
+      if (closed) return;
+      closed = true;
+      handlers.onClose(code, reason);
+    };
+    ws.addEventListener('open', () => {
+      opened = true;
+      handlers.onOpen();
+    });
     ws.addEventListener('message', (event) => {
       const data: unknown = event.data;
       if (typeof data === 'string') handlers.onText(data);
       else if (data instanceof ArrayBuffer) handlers.onBinary(new Uint8Array(data));
     });
-    ws.addEventListener('close', (event) => {
-      if (closed) return;
-      closed = true;
-      handlers.onClose(event.code, event.reason);
+    ws.addEventListener('close', (event) => finish(event.code, event.reason));
+    // Node 22 fires only error when a connect fails, never close, so that error is the close.
+    ws.addEventListener('error', () => {
+      if (!opened) finish(1006, 'connect failed');
     });
-    // A failed connect raises error and then close; close carries the report.
-    ws.addEventListener('error', () => undefined);
     return {
       sendText: (text) => ws.send(text),
       sendBinary: (bytes) => ws.send(bytes),
