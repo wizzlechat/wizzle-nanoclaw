@@ -3,14 +3,19 @@ import path from 'node:path';
 
 import type { SessionState } from '../../wizzle-protocol/src/index.ts';
 
+// Byte fields are base64url. expiresAt is the invite's unix seconds; phoneKey is set once a phone is pinned.
 export type StoredPairing = {
   relay: string;
   pairingId: string;
   secret: string;
+  bridgePublic: string;
+  bridgePrivate: string;
+  expiresAt: number;
   name?: string;
   runtime?: string;
   createdAt: string;
   pairedAt?: string;
+  phoneKey?: string;
 };
 
 function readJson<T>(file: string): T | null {
@@ -63,9 +68,11 @@ export class BridgeStore {
     return path.join(this.dir, 'invite.txt');
   }
 
+  // A pairing from before static keys has no bridge key and reads as no pairing.
   loadPairing(): StoredPairing | null {
     const stored = readJson<StoredPairing>(this.pairingFile);
     if (!stored || typeof stored.pairingId !== 'string' || typeof stored.secret !== 'string') return null;
+    if (typeof stored.bridgePublic !== 'string' || typeof stored.bridgePrivate !== 'string' || typeof stored.expiresAt !== 'number') return null;
     return stored;
   }
 
@@ -73,10 +80,10 @@ export class BridgeStore {
     writeJson(this.pairingFile, pairing);
   }
 
-  markPaired(): void {
+  markPaired(phoneKey: string): void {
     const pairing = this.loadPairing();
-    if (!pairing || pairing.pairedAt) return;
-    this.savePairing({ ...pairing, pairedAt: new Date().toISOString() });
+    if (!pairing || pairing.phoneKey === phoneKey) return;
+    this.savePairing({ ...pairing, pairedAt: new Date().toISOString(), phoneKey });
   }
 
   loadSession(): SessionState | null {

@@ -6,6 +6,8 @@ import { test } from 'node:test';
 
 import { BridgeStore } from '../src/store.ts';
 
+const RECORD = { relay: 'wss://r', pairingId: 'abc', secret: 'def', bridgePublic: 'pub', bridgePrivate: 'priv', expiresAt: 1_900_000_000, createdAt: '2026-01-01T00:00:00.000Z' };
+
 function tempStore(): BridgeStore {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wizzle-store-'));
   return new BridgeStore(path.join(dir, 'wizzle'));
@@ -14,7 +16,7 @@ function tempStore(): BridgeStore {
 test('pairing round trip with private file modes', () => {
   const store = tempStore();
   assert.equal(store.loadPairing(), null);
-  store.savePairing({ relay: 'wss://r', pairingId: 'abc', secret: 'def', createdAt: '2026-01-01T00:00:00.000Z' });
+  store.savePairing(RECORD);
   const loaded = store.loadPairing();
   assert.equal(loaded?.pairingId, 'abc');
   assert.equal(loaded?.pairedAt, undefined);
@@ -24,16 +26,25 @@ test('pairing round trip with private file modes', () => {
   assert.deepEqual(fs.readdirSync(store.dir), ['pairing.json']);
 });
 
-test('markPaired stamps once', () => {
+test('markPaired pins the phone key once', () => {
   const store = tempStore();
-  store.markPaired();
+  store.markPaired('phone');
   assert.equal(store.loadPairing(), null);
-  store.savePairing({ relay: 'wss://r', pairingId: 'abc', secret: 'def', createdAt: '2026-01-01T00:00:00.000Z' });
-  store.markPaired();
-  const first = store.loadPairing()?.pairedAt;
-  assert.ok(first);
-  store.markPaired();
-  assert.equal(store.loadPairing()?.pairedAt, first);
+  store.savePairing(RECORD);
+  store.markPaired('phone');
+  const first = store.loadPairing();
+  assert.ok(first?.pairedAt);
+  assert.equal(first?.phoneKey, 'phone');
+  store.markPaired('phone');
+  assert.equal(store.loadPairing()?.pairedAt, first?.pairedAt);
+});
+
+test('a pairing without static keys reads as none', () => {
+  const store = tempStore();
+  const { bridgePublic: _pub, bridgePrivate: _priv, expiresAt: _exp, ...old } = RECORD;
+  fs.mkdirSync(store.dir, { recursive: true });
+  fs.writeFileSync(path.join(store.dir, 'pairing.json'), JSON.stringify(old));
+  assert.equal(store.loadPairing(), null);
 });
 
 test('session state round trip and clear', () => {
@@ -42,7 +53,7 @@ test('session state round trip and clear', () => {
   const state = { epochs: [{ id: 'e', sendKey: 'k', recvKey: 'r', sendSeq: '3', recvSeq: '1' }], send: 'e' };
   store.saveSession(state);
   assert.deepEqual(store.loadSession(), state);
-  store.savePairing({ relay: 'wss://r', pairingId: 'abc', secret: 'def', createdAt: '2026-01-01T00:00:00.000Z' });
+  store.savePairing(RECORD);
   store.clear();
   assert.equal(store.loadSession(), null);
   assert.equal(store.loadPairing(), null);
