@@ -17,6 +17,7 @@ import {
   deletePendingQuestion,
   deleteSession,
   findSessionForAgent,
+  findTaskSessions,
   getSession,
   getSessionsByAgentGroup,
 } from '../db/sessions.js';
@@ -47,8 +48,11 @@ import {
   PairingManager,
   SYSTEM_CONV,
   WizzleBridge,
+  historyMessages,
   inviteText,
   isRelayUrl,
+  parseTimestamp,
+  taskEchoOrigins,
   webSocketTransport,
 } from './wizzle/index.js';
 import type {
@@ -62,14 +66,10 @@ import type {
   HostHistory,
   HostQuestion,
   IssuedInvite,
+  MailboxRow,
 } from './wizzle/index.js';
 import { nodeCrypto } from './wizzle/protocol/crypto-node.js';
-import {
-  type ChatMessage,
-  type ChatRole,
-  type QuestionOption,
-  type TemplateInfo,
-} from './wizzle/protocol/index.js';
+import { type QuestionOption, type TemplateInfo } from './wizzle/protocol/index.js';
 
 export const CHANNEL_TYPE = 'wizzle';
 export const OWNER_USER_ID = 'wizzle:owner';
@@ -220,37 +220,17 @@ async function sessionFor(agentGroupId: string, conv: string): Promise<AgentSess
   return group ? findSessionForAgent(agentGroupId, group.id, null) : undefined;
 }
 
-function parseTimestamp(value: string | null | undefined): number | undefined {
-  if (!value) return undefined;
-  const at = Date.parse(value);
-  return Number.isFinite(at) ? at : undefined;
-}
-
-type HistoryContent = { text: string; sender?: string; senderId?: string; msgId?: string; operation?: string };
-
-function historyText(content: string): HistoryContent | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(content);
-  } catch {
-    return content.length > 0 ? { text: content } : null;
+// A task's delivery lives in its own session's outbox; the echo in the conversation keeps only the first 500 characters.
+async function taskDeliveries(agentGroupId: string, ids: string[], limit: number): Promise<Map<string, MailboxRow>> {
+  const wanted = new Set(ids);
+  const found = new Map<string, MailboxRow>();
+  if (wanted.size === 0) return found;
+  for (const session of await findTaskSessions(agentGroupId, true)) {
+    const rows = await withExistingMailboxSession(agentGroupId, session.id, (mailbox) => mailbox.getOutboundHistory(limit));
+    for (const row of rows ?? []) if (wanted.has(row.id)) found.set(row.id, row);
+    if (found.size === wanted.size) break;
   }
-  if (typeof parsed === 'string') return parsed.length > 0 ? { text: parsed } : null;
-  if (!isRecord(parsed)) return null;
-  const text = typeof parsed.text === 'string' ? parsed.text : typeof parsed.markdown === 'string' ? parsed.markdown : null;
-  if (text === null || text.length === 0) return null;
-  return {
-    text,
-    ...(typeof parsed.sender === 'string' && { sender: parsed.sender }),
-    ...(typeof parsed.senderId === 'string' && { senderId: parsed.senderId }),
-    ...(typeof parsed.msgId === 'string' && { msgId: parsed.msgId }),
-    ...(typeof parsed.operation === 'string' && { operation: parsed.operation }),
-  };
-}
-
-// The row id is the stable msgId; only a core without it falls back to the old timestamp ids.
-function historyId(row: { id?: string }, fallback: string): string {
-  return typeof row.id === 'string' && row.id.length > 0 ? row.id : fallback;
+  return found;
 }
 
 function toQuestionOptions(options: Array<{ label: string; value: string; style?: string }>): QuestionOption[] {
@@ -632,26 +612,8 @@ export function createHost(notify: Notify): BridgeHost {
         outbound: mailbox.getOutboundHistory(limit),
       }));
       if (!rows) return { messages: [], hasMore: false };
-      const messages: ChatMessage[] = [];
-      for (const row of rows.inbound) {
-        if (row.kind !== 'chat' && row.kind !== 'chat-sdk') continue;
-        const parsed = historyText(row.content);
-        const at = parseTimestamp(row.timestamp);
-        if (!parsed || at === undefined) continue;
-        const role: ChatRole = parsed.senderId === 'system' ? 'system' : 'user';
-        const msgId = parsed.msgId ?? historyId(row, `in-${row.timestamp}-${messages.length}`);
-        messages.push({ conv, msgId, role, text: parsed.text, format: 'text', at });
-      }
-      for (const row of rows.outbound) {
-        if (row.kind === 'system' || row.kind === 'task_log') continue;
-        const parsed = historyText(row.content);
-        const at = parseTimestamp(row.timestamp);
-        // Edits and reactions carry an operation; they changed a message rather than being one.
-        if (!parsed || parsed.operation !== undefined || at === undefined) continue;
-        const msgId = historyId(row, `out-${row.timestamp}-${messages.length}`);
-        messages.push({ conv, msgId, role: 'agent', text: parsed.text, format: 'markdown', at });
-      }
-      messages.sort((a, b) => a.at - b.at);
+      const delivered = await taskDeliveries(target.agentGroupId, taskEchoOrigins(rows.inbound), limit);
+      const messages = historyMessages(conv, rows.inbound, rows.outbound, delivered);
       const hasMore = rows.inbound.length >= limit || rows.outbound.length >= limit || messages.length > limit;
       return { messages: messages.slice(-limit), hasMore };
     },
