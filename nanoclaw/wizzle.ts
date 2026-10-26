@@ -22,6 +22,7 @@ import {
   getSessionsByAgentGroup,
 } from '../db/sessions.js';
 import { readEnvFile } from '../env.js';
+import { configuredGatewayProviderKind } from '../gateway-providers/index.js';
 import { groupFolderExistsOnDisk, resolveGroupFolderPath } from '../group-folder.js';
 import { readGroupPersona, stageGroupPersona } from '../group-persona.js';
 import { log } from '../log.js';
@@ -33,6 +34,7 @@ import {
   withExistingMailboxSession,
   writeSessionMessage,
 } from '../session-manager.js';
+import { ensureTemplateLocal } from '../templates/library.js';
 import { PLUGIN_MANIFEST_FILE, parsePluginManifest, type PluginManifest } from '../templates/manifest.js';
 import { resolveLocalTemplate } from '../templates/local-dir.js';
 import { parseTemplate, type Template } from '../templates/parse.js';
@@ -69,7 +71,15 @@ import type {
   MailboxRow,
 } from './wizzle/index.js';
 import { nodeCrypto } from './wizzle/protocol/crypto-node.js';
-import { type QuestionOption, type TemplateInfo } from './wizzle/protocol/index.js';
+import {
+  type QuestionOption,
+  type Secret,
+  type SecretChanges,
+  type SecretInjection,
+  type SecretInput,
+  type SecretType,
+  type TemplateInfo,
+} from './wizzle/protocol/index.js';
 
 export const CHANNEL_TYPE = 'wizzle';
 export const OWNER_USER_ID = 'wizzle:owner';
@@ -86,6 +96,8 @@ const FOLDER_SUFFIX_MAX = 9;
 const ONBOARDING_TIMEOUT_S = 1800;
 const RESERVED_AGENT_NAMES = new Set(['system']);
 const SYSTEM_AGENT_ID = 'system';
+const ONECLI_TIMEOUT_MS = 10_000;
+const SECRET_TYPES: SecretType[] = ['generic', 'anthropic', 'openai'];
 
 const WIZZLE_DEFAULTS: ChannelDefaults = {
   dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'public' },
@@ -271,6 +283,21 @@ function stopContainer(sessionId: string, reason = 'wizzle topic deleted', ms = 
   });
 }
 
+// Stops the container, then takes the session's pending rows, mailbox, files and row; the wiring is the caller's.
+async function dropSession(agentGroupId: string, session: AgentSession, busy: string, reason: string): Promise<string[]> {
+  if (isContainerRunning(session.id) && !(await stopContainer(session.id, reason))) throw coded('busy', busy);
+  const questionIds = await clearPendingForSession(session.id);
+  await destroySessionMailbox(agentGroupId, session.id);
+  const dir = sessionDir(agentGroupId, session.id);
+  // Docker's mount points here are root's and stay; everything else is the chat's.
+  for (const name of fs.readdirSync(dir)) {
+    const entry = path.join(dir, name);
+    if (fs.lstatSync(entry).uid === process.getuid!()) fs.rmSync(entry, { recursive: true, force: true });
+  }
+  await deleteSession(session.id);
+  return questionIds;
+}
+
 // wirings-create writes a companion agent_destinations row; wirings-delete does not remove it.
 async function removeCompanionDestination(agentGroupId: string, messagingGroupId: string): Promise<void> {
   if (!(await hasTable(getDb(), 'agent_destinations'))) return;
@@ -362,8 +389,13 @@ function toTemplateInfo(ref: string, template: Template, manifest: PluginManifes
   };
 }
 
-// A missing templates directory is an install without templates, not a failure.
+// The installed templates, then the public library's. Library copies land in templates/<category>/<name>.
 export async function listTemplates(): Promise<TemplateInfo[]> {
+  return [...installedTemplates(), ...(await libraryTemplates())];
+}
+
+// A missing templates directory is an install without templates, not a failure.
+function installedTemplates(): TemplateInfo[] {
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(TEMPLATES_DIR, { withFileTypes: true });
@@ -382,6 +414,49 @@ export async function listTemplates(): Promise<TemplateInfo[]> {
     }
   }
   return out;
+}
+
+// templates-list caches the index for five minutes; a library it cannot reach lists nothing.
+async function libraryTemplates(): Promise<TemplateInfo[]> {
+  let rows: unknown;
+  try {
+    rows = await hostCommand('templates-list', { registry: true });
+  } catch (err) {
+    log.warn('wizzle: the template library could not be listed', { err });
+    return [];
+  }
+  if (!Array.isArray(rows)) return [];
+  const out: TemplateInfo[] = [];
+  for (const row of rows) {
+    if (!isRecord(row) || typeof row.ref !== 'string' || typeof row.name !== 'string') continue;
+    // The library files every template as <category>/<template>.
+    const cut = row.ref.indexOf('/');
+    if (cut < 1) continue;
+    const library = { category: row.ref.slice(0, cut), downloaded: row.local === true };
+    const description = typeof row.description === 'string' && row.description.length > 0 ? row.description : undefined;
+    out.push({ ...(downloadedTemplate(row.ref) ?? { ref: row.ref, name: row.name, ...(description && { description }) }), ...library });
+  }
+  return out;
+}
+
+function downloadedTemplate(ref: string): TemplateInfo | undefined {
+  const dir = path.join(TEMPLATES_DIR, ref);
+  if (!fs.existsSync(path.join(dir, PLUGIN_MANIFEST_FILE))) return undefined;
+  try {
+    return toTemplateInfo(ref, parseTemplate(dir), readManifest(dir));
+  } catch (err) {
+    log.warn('wizzle: downloaded template skipped, it does not parse', { ref, err });
+    return undefined;
+  }
+}
+
+// A library template is fetched before anything is created, so a failed download leaves nothing behind.
+async function fetchTemplate(ref: string): Promise<void> {
+  try {
+    await ensureTemplateLocal(ref);
+  } catch (err) {
+    throw coded('unknown_template', err instanceof Error ? err.message : `No template called "${ref}"`);
+  }
 }
 
 function loadTemplate(ref: string): Template {
@@ -470,6 +545,202 @@ function readPersona(folder: string): string | null {
   }
 }
 
+// Keys go straight to OneCLI, so only an install whose gateway is OneCLI offers them.
+function usesOneCli(): boolean {
+  try {
+    return configuredGatewayProviderKind() === 'onecli';
+  } catch {
+    return false;
+  }
+}
+
+// OneCLI's REST API, at the address and key NanoClaw's own OneCLI gateway uses.
+async function onecli(method: string, route: string, body?: unknown): Promise<unknown> {
+  const base = (envValue('ONECLI_URL') || 'https://api.onecli.sh').replace(/\/+$/, '');
+  const headers: Record<string, string> = {};
+  const apiKey = envValue('ONECLI_API_KEY');
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  if (process.env.ONECLI_PROJECT_ID) headers['X-Project-Id'] = process.env.ONECLI_PROJECT_ID;
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  let res: Response;
+  try {
+    res = await fetch(`${base}${route}`, {
+      method,
+      headers,
+      ...(body !== undefined && { body: JSON.stringify(body) }),
+      signal: AbortSignal.timeout(ONECLI_TIMEOUT_MS),
+    });
+  } catch (err) {
+    throw Object.assign(coded('keys_unavailable', 'OneCLI could not be reached'), { cause: err });
+  }
+  const parsed: unknown = res.status === 204 ? undefined : await res.json().catch(() => undefined);
+  if (res.ok) return parsed;
+  // A refused body answers { error: text }, any other failure { error: { message } }.
+  const error = isRecord(parsed) ? parsed.error : undefined;
+  const message =
+    typeof error === 'string' ? error : isRecord(error) && typeof error.message === 'string' ? error.message : `OneCLI answered ${res.status}`;
+  const code = res.status === 404 ? 'not_found' : res.status < 500 ? 'bad_request' : 'keys_failed';
+  throw Object.assign(coded(code, message), { status: res.status });
+}
+
+function onecliRows(body: unknown): unknown[] {
+  const rows = Array.isArray(body) ? body : isRecord(body) ? body.data : undefined;
+  if (!Array.isArray(rows)) throw coded('keys_failed', 'OneCLI did not answer with a list');
+  return rows;
+}
+
+function toInjection(raw: unknown): SecretInjection | undefined {
+  if (!isRecord(raw)) return undefined;
+  const text = (key: string) => (typeof raw[key] === 'string' ? (raw[key] as string) : undefined);
+  const headerName = text('headerName');
+  if (headerName) return { headerName, ...(text('valueFormat') && { valueFormat: text('valueFormat') }) };
+  const paramName = text('paramName');
+  if (paramName) return { paramName, ...(text('paramFormat') && { paramFormat: text('paramFormat') }) };
+  const pathTemplate = text('pathTemplate');
+  if (pathTemplate) return { pathTemplate };
+  const pathRegex = text('pathRegex');
+  const pathReplacement = text('pathReplacement');
+  if (pathRegex && pathReplacement) return { pathRegex, pathReplacement };
+  return undefined;
+}
+
+// Only what the phone shows; OneCLI never lists a value.
+function toSecret(row: unknown): Secret | undefined {
+  if (!isRecord(row) || typeof row.id !== 'string' || typeof row.name !== 'string' || typeof row.hostPattern !== 'string') return undefined;
+  const type = SECRET_TYPES.find((one) => one === row.type);
+  if (!type) return undefined;
+  const injection = toInjection(row.injectionConfig);
+  const createdAt = parseTimestamp(typeof row.createdAt === 'string' ? row.createdAt : undefined);
+  return {
+    id: row.id,
+    name: row.name,
+    type,
+    host: row.hostPattern,
+    ...(typeof row.pathPattern === 'string' && row.pathPattern.length > 0 && { path: row.pathPattern }),
+    ...(injection && { injection }),
+    ...(createdAt !== undefined && { createdAt }),
+  };
+}
+
+export async function listSecrets(): Promise<Secret[]> {
+  return onecliRows(await onecli('GET', '/v1/secrets'))
+    .map(toSecret)
+    .filter((secret): secret is Secret => secret !== undefined);
+}
+
+async function savedSecret(secretId: string): Promise<Secret> {
+  const secret = (await listSecrets()).find((one) => one.id === secretId);
+  if (!secret) throw coded('keys_failed', 'OneCLI saved the key but does not list it');
+  return secret;
+}
+
+async function createSecret(input: SecretInput): Promise<Secret> {
+  const created = await onecli('POST', '/v1/secrets', {
+    name: input.name,
+    type: input.type,
+    value: input.value,
+    hostPattern: input.host,
+    ...(input.path !== undefined && { pathPattern: input.path }),
+    ...(input.injection !== undefined && { injectionConfig: input.injection }),
+  });
+  if (!isRecord(created) || typeof created.id !== 'string') throw coded('keys_failed', 'OneCLI did not return the new key');
+  return savedSecret(created.id);
+}
+
+async function updateSecret(secretId: string, changes: SecretChanges): Promise<Secret> {
+  await onecli('PATCH', `/v1/secrets/${encodeURIComponent(secretId)}`, {
+    ...(changes.name !== undefined && { name: changes.name }),
+    ...(changes.host !== undefined && { hostPattern: changes.host }),
+    ...(changes.path !== undefined && { pathPattern: changes.path }),
+    ...(changes.injection !== undefined && { injectionConfig: changes.injection }),
+    ...(changes.value !== undefined && { value: changes.value }),
+  });
+  return savedSecret(secretId);
+}
+
+async function keyGroup(agentId: string): Promise<AgentGroup> {
+  if (agentId === SYSTEM_AGENT_ID) throw coded('bad_request', 'The System agent has no keys');
+  const group = await getAgentGroup(agentId);
+  if (!group) throw coded('unknown_agent', 'No such agent');
+  return group;
+}
+
+// A group's OneCLI agent has the group id as its identifier and is made on its first spawn, or here.
+async function findOnecliAgent(group: AgentGroup): Promise<string | undefined> {
+  const agent = onecliRows(await onecli('GET', '/v1/agents')).find((one) => isRecord(one) && one.identifier === group.id);
+  return isRecord(agent) && typeof agent.id === 'string' ? agent.id : undefined;
+}
+
+async function ensureOnecliAgent(group: AgentGroup): Promise<string> {
+  const found = await findOnecliAgent(group);
+  if (found) return found;
+  try {
+    await onecli('POST', '/v1/agents', { name: group.name, identifier: group.id });
+  } catch (err) {
+    // 409 is a spawn that made it first.
+    if (!(isRecord(err) && err.status === 409)) throw err;
+  }
+  const made = await findOnecliAgent(group);
+  if (!made) throw coded('keys_failed', `OneCLI has no agent for ${group.name}`);
+  return made;
+}
+
+function grantPath(onecliAgentId: string, secretId: string): string {
+  return `/v1/agents/${encodeURIComponent(onecliAgentId)}/grants/secrets/${encodeURIComponent(secretId)}`;
+}
+
+async function listAgentSecrets(agentId: string): Promise<string[]> {
+  const agent = await findOnecliAgent(await keyGroup(agentId));
+  if (!agent) return [];
+  const grants = await onecli('GET', `/v1/agents/${encodeURIComponent(agent)}/grants`);
+  const secrets = isRecord(grants) && Array.isArray(grants.secrets) ? grants.secrets : [];
+  return secrets.flatMap((grant) => (isRecord(grant) && typeof grant.secretId === 'string' ? [grant.secretId] : []));
+}
+
+async function attachSecret(agentId: string, secretId: string): Promise<void> {
+  await onecli('PUT', grantPath(await ensureOnecliAgent(await keyGroup(agentId)), secretId));
+}
+
+async function detachSecret(agentId: string, secretId: string): Promise<void> {
+  const agent = await findOnecliAgent(await keyGroup(agentId));
+  if (agent) await onecli('DELETE', grantPath(agent, secretId));
+}
+
+async function deleteSecret(secretId: string): Promise<void> {
+  await onecli('DELETE', `/v1/secrets/${encodeURIComponent(secretId)}`);
+}
+
+// Names by id, or null when OneCLI cannot be reached and the create goes ahead without checking.
+async function vaultNames(): Promise<Map<string, string> | null> {
+  try {
+    return new Map((await listSecrets()).map((secret) => [secret.id, secret.name]));
+  } catch (err) {
+    log.warn('wizzle: the vault could not be read before creating an agent', { err });
+    return null;
+  }
+}
+
+// Answers the ids that did not attach; the agent exists either way.
+async function attachKeys(group: AgentGroup, secretIds: string[]): Promise<string[]> {
+  let agent: string;
+  try {
+    agent = await ensureOnecliAgent(group);
+  } catch (err) {
+    log.warn('wizzle: the new agent has no OneCLI agent to attach keys to', { agent: group.id, err });
+    return secretIds;
+  }
+  const failed: string[] = [];
+  for (const secretId of secretIds) {
+    try {
+      await onecli('PUT', grantPath(agent, secretId));
+    } catch (err) {
+      log.warn('wizzle: a key did not attach to the new agent', { agent: group.id, secretId, err });
+      failed.push(secretId);
+    }
+  }
+  return failed;
+}
+
 function onboardingText(name: string, purpose: string, pausedTasks: string[]): string {
   const lines = [
     `You are ${name}. You were created from the owner's phone a moment ago and this is your first turn.`,
@@ -529,12 +800,17 @@ export async function createAgent(request: HostCreateAgent, notify: Notify): Pro
   const timezone = request.timezone?.trim() || undefined;
   if (timezone && !isValidTimezone(timezone)) throw coded('bad_request', `${timezone} is not an IANA timezone id`);
   if (request.copyFrom === SYSTEM_AGENT_ID) throw coded('bad_request', 'System is not an agent you can copy');
+  const secretIds = request.secrets ?? [];
+  const names = secretIds.length > 0 ? await vaultNames() : null;
+  const gone = names ? secretIds.filter((id) => !names.has(id)) : [];
+  if (gone.length > 0) throw coded('unknown_secret', `${gone.length === 1 ? 'A key you picked is' : 'Keys you picked are'} no longer in the vault`);
 
   let group: AgentGroup;
   let pausedTasks: string[] = [];
   let skippedPackages: string[] = [];
 
   if (request.template !== undefined) {
+    await fetchTemplate(request.template);
     const template = loadTemplate(request.template);
     pausedTasks = template.tasks.map((task) => task.name);
     group = parseAgentGroup(
@@ -562,6 +838,12 @@ export async function createAgent(request: HostCreateAgent, notify: Notify): Pro
 
   const conv = await ensureConversation(group);
   const agent: HostAgent = { id: group.id, name: group.name, conv, status: 'idle' };
+  // Before onboarding, so the first spawn already carries the keys.
+  const unattached = secretIds.length > 0 ? await attachKeys(group, secretIds) : [];
+  if (unattached.length > 0) {
+    const list = unattached.map((id) => names?.get(id) ?? id).join(', ');
+    notify(conv, `${group.name} was created without these keys, which could not be attached: ${list}. Attach them from ${group.name}'s Keys.`);
+  }
   if (!purpose) return agent;
 
   try {
@@ -643,6 +925,8 @@ export function createHost(notify: Notify): BridgeHost {
 
     listTemplates,
 
+    ...(usesOneCli() && { listSecrets, createSecret, updateSecret, deleteSecret, listAgentSecrets, attachSecret, detachSecret }),
+
     async listConversations(): Promise<HostConversation[]> {
       const out: HostConversation[] = [];
       for (const agent of await getAllAgentGroups()) {
@@ -723,20 +1007,28 @@ export function createHost(notify: Notify): BridgeHost {
       const wirings = await getMessagingGroupAgents(group.id);
       const agentGroupId = wirings[0]?.agent_group_id ?? parsed.agentGroupId;
       const session = await findSessionForAgent(agentGroupId, group.id, null);
-      let questionIds: string[] = [];
-      if (session) {
-        if (isContainerRunning(session.id) && !(await stopContainer(session.id))) {
-          throw coded('busy', 'That topic is still running, try again in a moment');
-        }
-        questionIds = await clearPendingForSession(session.id);
-        await destroySessionMailbox(agentGroupId, session.id);
-        fs.rmSync(sessionDir(agentGroupId, session.id), { recursive: true, force: true });
-        await deleteSession(session.id);
-      }
+      const questionIds = session
+        ? await dropSession(agentGroupId, session, 'That topic is still running, try again in a moment', 'wizzle topic deleted')
+        : [];
       await removeCompanionDestination(agentGroupId, group.id);
       for (const wiring of wirings) await hostCommand('wirings-delete', { id: wiring.id });
       await hostCommand('messaging-groups-delete', { id: group.id });
       return { questionIds };
+    },
+
+    // The wiring and messaging group stay, so the next message opens a fresh session.
+    async clearConversation(conv): Promise<HostDeleted> {
+      const target = await targetFor(conv);
+      if (!target) throw coded('unknown_conv', 'No such conversation');
+      const { agentGroupId, session } = target;
+      if (!session) return { questionIds: [] };
+      // Tasks scheduled before ncl tasks live in the chat session that made them and would go with it.
+      const tasks = (await withExistingMailboxSession(agentGroupId, session.id, (mailbox) => mailbox.listLiveTasks().length)) ?? 0;
+      if (tasks > 0) {
+        const one = tasks === 1;
+        throw coded('has_tasks', `This chat holds ${tasks} scheduled ${one ? 'task' : 'tasks'}; cancel ${one ? 'it' : 'them'} before clearing.`);
+      }
+      return { questionIds: await dropSession(agentGroupId, session, 'The agent is still running, try again in a moment', 'wizzle conversation cleared') };
     },
 
     // Open questions and approvals go too: an answer would wake the paused agent.

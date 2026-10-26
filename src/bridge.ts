@@ -15,6 +15,11 @@ import {
   type FileMeta,
   type Packet,
   type QuestionOption,
+  type Secret,
+  type SecretChanges,
+  type SecretInjection,
+  type SecretInput,
+  type SecretType,
   type SessionState,
   type TemplateInfo,
 } from '../../wizzle-protocol/src/index.ts';
@@ -33,6 +38,12 @@ const DEFAULT_HISTORY = 50;
 const MAX_HISTORY = 200;
 const MAX_TITLE_CHARS = 60;
 const MAX_PURPOSE_CHARS = 4000;
+// OneCLI's own limits on a secret's fields.
+const MAX_SECRET_NAME = 255;
+const MAX_SECRET_FIELD = 1000;
+const MAX_SECRET_VALUE = 10_000;
+const MAX_AGENT_SECRETS = 64;
+const SECRET_TYPES: SecretType[] = ['generic', 'anthropic', 'openai'];
 const MSG_ID = /^[A-Za-z0-9_-]{1,64}$/;
 // NanoClaw refreshes typing every 4 seconds while the agent works; this long without one means it stopped.
 const ACTIVITY_SILENCE_MS = 12_000;
@@ -44,7 +55,7 @@ export type HostQuestion = { title: string; question?: string; options: Question
 export type HostConversation = { conv: string; agentId: string; title: string; lastAt?: number; topic: boolean; createdAt?: number };
 export type HostDeleted = { questionIds?: string[] };
 // Everything the phone can put in one create_agent, already validated by the bridge.
-export type HostCreateAgent = { name: string; purpose?: string; template?: string; copyFrom?: string; timezone?: string };
+export type HostCreateAgent = { name: string; purpose?: string; template?: string; copyFrom?: string; timezone?: string; secrets?: string[] };
 
 // What the bridge needs from the runtime. The NanoClaw adapter implements it on the host DB.
 export interface BridgeHost {
@@ -61,11 +72,21 @@ export interface BridgeHost {
   createConversation?(agentId: string, title: string): Promise<HostConversation>;
   renameConversation?(conv: string, title: string): Promise<HostConversation>;
   deleteConversation?(conv: string): Promise<HostDeleted | void>;
+  // Drops the conversation's session, so its history and the agent's context go and the conversation stays.
+  clearConversation?(conv: string): Promise<HostDeleted | void>;
   // Pause answers with the open questions it cancelled, so the phone can close them.
   pauseAgent?(agentId: string): Promise<HostDeleted | void>;
   resumeAgent?(agentId: string): Promise<void>;
   restartAgent?(agentId: string, message?: string): Promise<void>;
   deleteAgent?(agentId: string, removeWorkspace: boolean): Promise<HostDeleted | void>;
+  // The credential vault; a value goes in and never comes back out.
+  listSecrets?(): Promise<Secret[]>;
+  createSecret?(input: SecretInput): Promise<Secret>;
+  updateSecret?(secretId: string, changes: SecretChanges): Promise<Secret>;
+  deleteSecret?(secretId: string): Promise<void>;
+  listAgentSecrets?(agentId: string): Promise<string[]>;
+  attachSecret?(agentId: string, secretId: string): Promise<void>;
+  detachSecret?(agentId: string, secretId: string): Promise<void>;
 }
 
 export type InboundAttachment = { name: string; mimeType: string; size: number; data: string };
@@ -148,7 +169,7 @@ export class WizzleBridge {
       tasks: false,
       files: true,
       history: true,
-      clearSession: false,
+      clearSession: typeof opts.host.clearConversation === 'function',
       abort: false,
       createAgent: typeof opts.host.createAgent === 'function',
       templates: typeof opts.host.listTemplates === 'function',
@@ -162,6 +183,15 @@ export class WizzleBridge {
         typeof opts.host.resumeAgent === 'function' &&
         typeof opts.host.restartAgent === 'function',
       deleteAgent: typeof opts.host.deleteAgent === 'function',
+      keys: [
+        opts.host.listSecrets,
+        opts.host.createSecret,
+        opts.host.updateSecret,
+        opts.host.deleteSecret,
+        opts.host.listAgentSecrets,
+        opts.host.attachSecret,
+        opts.host.detachSecret,
+      ].every((method) => typeof method === 'function'),
       ...opts.capabilities,
     };
   }
@@ -429,9 +459,27 @@ export class WizzleBridge {
   private async sendCatalog(link: Link): Promise<void> {
     const agents = await this.refreshAgents();
     this.reply(link, { t: 'agents', agents: [...agents.map(toAgent), SYSTEM_AGENT] });
-    const conversations: Conversation[] = (await this.refreshConvs(agents)).map(toConversation);
+    const conversations: Conversation[] = [];
+    for (const conv of await this.refreshConvs(agents)) {
+      const lastAgentAt = await this.lastAgentAt(conv.conv);
+      conversations.push({ ...toConversation(conv), ...(lastAgentAt !== undefined && { lastAgentAt }) });
+    }
     conversations.push({ id: SYSTEM_CONV, agentId: SYSTEM_AGENT.id, title: SYSTEM_AGENT.name });
     this.reply(link, { t: 'conversations', conversations });
+  }
+
+  // Read from the page a phone's history request gets, so a phone holding that page never needs to ask again.
+  private async lastAgentAt(conv: string): Promise<number | undefined> {
+    let messages: ChatMessage[];
+    try {
+      messages = (await this.host.history(conv, DEFAULT_HISTORY)).messages;
+    } catch (err) {
+      this.log.warn('wizzle: history unreadable for the catalog', { conv, err });
+      return undefined;
+    }
+    let at: number | undefined;
+    for (const message of messages) if (message.role === 'agent' && (at === undefined || message.at > at)) at = message.at;
+    return at;
   }
 
   private async broadcastCatalog(): Promise<void> {
@@ -608,12 +656,22 @@ export class WizzleBridge {
           this.fail(link, ref, 'bad_request', 'create_agent takes a template or a copyFrom, not both');
           return;
         }
+        const secrets = secretIds(header.secrets);
+        if (secrets === null) {
+          this.fail(link, ref, 'bad_request', `secrets is a list of at most ${MAX_AGENT_SECRETS} secret ids`);
+          return;
+        }
+        if (secrets.length > 0 && !this.capabilities.keys) {
+          this.fail(link, ref, 'unsupported', 'Keys are not available');
+          return;
+        }
         const request: HostCreateAgent = {
           name,
           ...(rawPurpose !== undefined && { purpose: rawPurpose }),
           ...(template !== undefined && { template }),
           ...(copyFrom !== undefined && { copyFrom }),
           ...(optionalText(header.timezone) !== undefined && { timezone: optionalText(header.timezone) as string }),
+          ...(secrets.length > 0 && { secrets }),
         };
         try {
           const created = await this.host.createAgent(request);
@@ -730,6 +788,40 @@ export class WizzleBridge {
         }
         return;
       }
+      case 'clear': {
+        if (!this.host.clearConversation) {
+          this.fail(link, ref, 'unsupported', 'Clearing a conversation is not available');
+          return;
+        }
+        const conv = header.conv;
+        if (typeof conv !== 'string' || conv.length === 0) {
+          this.fail(link, ref, 'bad_request', 'clear needs conv');
+          return;
+        }
+        if (conv === SYSTEM_CONV) {
+          this.fail(link, ref, 'read_only', 'The System conversation cannot be cleared');
+          return;
+        }
+        if (!(await this.knownConv(conv))) {
+          this.fail(link, ref, 'unknown_conv', 'No such conversation');
+          return;
+        }
+        try {
+          const result = await this.host.clearConversation(conv);
+          for (const questionId of result?.questionIds ?? []) {
+            this.questionConv.delete(questionId);
+            this.broadcast({ t: 'question_resolved', questionId, id: randomUUID() });
+          }
+          this.awaiting.delete(conv);
+          this.resetActivity(conv);
+          this.broadcast({ t: 'session', conv, event: 'cleared', id: randomUUID() });
+          await this.broadcastCatalog();
+        } catch (err) {
+          this.log.warn('wizzle: conversation clear failed', { err });
+          this.failHost(link, ref, err, 'clear_failed', 'Clearing the conversation failed');
+        }
+        return;
+      }
       case 'pause_agent':
       case 'resume_agent':
       case 'restart_agent': {
@@ -787,7 +879,17 @@ export class WizzleBridge {
         }
         return;
       }
-      case 'clear':
+      case 'secrets':
+      case 'create_secret':
+      case 'update_secret':
+      case 'delete_secret':
+        await this.handleSecret(link, ref, header);
+        return;
+      case 'agent_secrets':
+      case 'attach_secret':
+      case 'detach_secret':
+        await this.handleAgentSecret(link, ref, header);
+        return;
       case 'abort':
       case 'tasks':
       case 'run_task':
@@ -795,6 +897,99 @@ export class WizzleBridge {
         return;
       default:
         this.fail(link, ref, 'unknown', `Unknown packet type ${header.t}`);
+    }
+  }
+
+  private async handleSecret(link: Link, ref: string | undefined, header: Record<string, unknown>): Promise<void> {
+    const host = this.host;
+    if (!this.capabilities.keys || !host.listSecrets || !host.createSecret || !host.updateSecret || !host.deleteSecret) {
+      this.fail(link, ref, 'unsupported', 'Keys are not available');
+      return;
+    }
+    try {
+      if (header.t === 'secrets') {
+        this.reply(link, { t: 'secrets', secrets: await host.listSecrets() });
+        return;
+      }
+      if (header.t === 'create_secret') {
+        const input = secretInput(header.secret);
+        if (typeof input === 'string') {
+          this.fail(link, ref, 'bad_request', input);
+          return;
+        }
+        this.reply(link, { t: 'secret', ...(ref !== undefined && { ref }), secret: await host.createSecret(input) });
+        await this.broadcastSecrets();
+        return;
+      }
+      const secretId = optionalText(header.secretId);
+      if (secretId === undefined) {
+        this.fail(link, ref, 'bad_request', `${String(header.t)} needs secretId`);
+        return;
+      }
+      if (header.t === 'update_secret') {
+        const changes = secretChanges(header.changes);
+        if (typeof changes === 'string') {
+          this.fail(link, ref, 'bad_request', changes);
+          return;
+        }
+        this.reply(link, { t: 'secret', ...(ref !== undefined && { ref }), secret: await host.updateSecret(secretId, changes) });
+        await this.broadcastSecrets();
+        return;
+      }
+      await host.deleteSecret(secretId);
+      this.broadcast({ t: 'secret_deleted', secretId, id: randomUUID() });
+      await this.broadcastSecrets();
+    } catch (err) {
+      this.log.warn('wizzle: key request failed', { t: header.t, err });
+      this.failHost(link, ref, err, 'keys_failed', 'The key request failed');
+    }
+  }
+
+  private async handleAgentSecret(link: Link, ref: string | undefined, header: Record<string, unknown>): Promise<void> {
+    const host = this.host;
+    if (!this.capabilities.keys || !host.listAgentSecrets || !host.attachSecret || !host.detachSecret) {
+      this.fail(link, ref, 'unsupported', 'Keys are not available');
+      return;
+    }
+    const agentId = optionalText(header.agentId);
+    if (agentId === undefined) {
+      this.fail(link, ref, 'bad_request', `${String(header.t)} needs agentId`);
+      return;
+    }
+    if (agentId === SYSTEM_AGENT.id) {
+      this.fail(link, ref, 'bad_request', 'The System agent has no keys');
+      return;
+    }
+    const agent = (await this.refreshAgents()).find((a) => a.id === agentId);
+    if (!agent) {
+      this.fail(link, ref, 'unknown_agent', 'No such agent');
+      return;
+    }
+    try {
+      if (header.t === 'agent_secrets') {
+        this.reply(link, { t: 'agent_secrets', agentId, secretIds: await host.listAgentSecrets(agentId) });
+        return;
+      }
+      const secretId = optionalText(header.secretId);
+      if (secretId === undefined) {
+        this.fail(link, ref, 'bad_request', `${String(header.t)} needs agentId and secretId`);
+        return;
+      }
+      if (header.t === 'attach_secret') await host.attachSecret(agentId, secretId);
+      else await host.detachSecret(agentId, secretId);
+      this.broadcast({ t: 'agent_secrets', agentId, secretIds: await host.listAgentSecrets(agentId), id: randomUUID() });
+    } catch (err) {
+      this.log.warn('wizzle: agent key request failed', { t: header.t, agentId, err });
+      this.failHost(link, ref, err, 'keys_failed', `${agent.name}'s keys could not be changed`);
+    }
+  }
+
+  // Every phone sees the vault change; a listing that fails here leaves the phones' copy until they ask again.
+  private async broadcastSecrets(): Promise<void> {
+    try {
+      this.broadcast({ t: 'secrets', secrets: (await this.host.listSecrets?.()) ?? [], id: randomUUID() });
+    } catch (err) {
+      this.log.warn('wizzle: listing keys after a change failed', { err });
     }
   }
 
@@ -864,6 +1059,100 @@ function optionalText(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const text = value.trim();
   return text.length > 0 ? text : undefined;
+}
+
+// Undefined is no list; null is a list the bridge refuses.
+function secretIds(value: unknown): string[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > MAX_AGENT_SECRETS) return null;
+  const ids = value.map(optionalText);
+  if (ids.some((id) => id === undefined || id.length > MAX_SECRET_FIELD)) return null;
+  return [...new Set(ids as string[])];
+}
+
+function boundedText(value: unknown, max: number): string | undefined {
+  const text = optionalText(value);
+  return text !== undefined && text.length <= max ? text : undefined;
+}
+
+// Exactly one of OneCLI's four shapes; a string is the reason it is refused.
+function secretInjection(value: unknown): SecretInjection | string {
+  if (!isRecord(value)) return 'injection must be an object';
+  const keys = Object.keys(value).sort().join(',');
+  const field = (name: string) => boundedText(value[name], MAX_SECRET_FIELD);
+  const format = (name: string) => (value[name] === undefined ? undefined : field(name));
+  if (keys === 'headerName' || keys === 'headerName,valueFormat') {
+    const headerName = field('headerName');
+    const valueFormat = format('valueFormat');
+    if (headerName === undefined || (value.valueFormat !== undefined && valueFormat === undefined)) return 'A header needs a name';
+    return { headerName, ...(valueFormat !== undefined && { valueFormat }) };
+  }
+  if (keys === 'paramName' || keys === 'paramFormat,paramName') {
+    const paramName = field('paramName');
+    const paramFormat = format('paramFormat');
+    if (paramName === undefined || (value.paramFormat !== undefined && paramFormat === undefined)) return 'A parameter needs a name';
+    return { paramName, ...(paramFormat !== undefined && { paramFormat }) };
+  }
+  if (keys === 'pathTemplate') {
+    const pathTemplate = field('pathTemplate');
+    return pathTemplate === undefined ? 'A path template cannot be empty' : { pathTemplate };
+  }
+  if (keys === 'pathRegex,pathReplacement') {
+    const pathRegex = field('pathRegex');
+    const pathReplacement = field('pathReplacement');
+    if (pathRegex === undefined || pathReplacement === undefined) return 'A path regex needs a pattern and a replacement';
+    return { pathRegex, pathReplacement };
+  }
+  return 'injection is a header, a parameter, a path template or a path regex';
+}
+
+function secretInput(value: unknown): SecretInput | string {
+  if (!isRecord(value)) return 'create_secret needs a secret';
+  const name = boundedText(value.name, MAX_SECRET_NAME);
+  const host = boundedText(value.host, MAX_SECRET_FIELD);
+  const type = SECRET_TYPES.find((one) => one === value.type);
+  // The value is kept as typed; a key can end in whitespace.
+  const secret = typeof value.value === 'string' && value.value.length > 0 && value.value.length <= MAX_SECRET_VALUE ? value.value : undefined;
+  if (name === undefined || host === undefined || type === undefined || secret === undefined) {
+    return `A key needs a name, a type, a host and a value of at most ${MAX_SECRET_VALUE} characters`;
+  }
+  const path = value.path === undefined ? undefined : boundedText(value.path, MAX_SECRET_FIELD);
+  if (value.path !== undefined && path === undefined) return 'path must be text';
+  const injection = value.injection === undefined ? undefined : secretInjection(value.injection);
+  if (typeof injection === 'string') return injection;
+  return { name, type, host, value: secret, ...(path !== undefined && { path }), ...(injection !== undefined && { injection }) };
+}
+
+function secretChanges(value: unknown): SecretChanges | string {
+  if (!isRecord(value)) return 'update_secret needs changes';
+  const changes: SecretChanges = {};
+  if (value.name !== undefined) {
+    const name = boundedText(value.name, MAX_SECRET_NAME);
+    if (name === undefined) return `A name is 1 to ${MAX_SECRET_NAME} characters`;
+    changes.name = name;
+  }
+  if (value.host !== undefined) {
+    const host = boundedText(value.host, MAX_SECRET_FIELD);
+    if (host === undefined) return 'A host cannot be empty';
+    changes.host = host;
+  }
+  if (value.path !== undefined) {
+    const path = value.path === null ? null : boundedText(value.path, MAX_SECRET_FIELD);
+    if (path === undefined) return 'path is text or null';
+    changes.path = path;
+  }
+  if (value.injection !== undefined) {
+    const injection = value.injection === null ? null : secretInjection(value.injection);
+    if (typeof injection === 'string') return injection;
+    changes.injection = injection;
+  }
+  if (value.value !== undefined) {
+    if (typeof value.value !== 'string' || value.value.length === 0 || value.value.length > MAX_SECRET_VALUE) {
+      return `A value is 1 to ${MAX_SECRET_VALUE} characters`;
+    }
+    changes.value = value.value;
+  }
+  return Object.keys(changes).length > 0 ? changes : 'update_secret changes nothing';
 }
 
 function activity_packet(activity: Activity): BridgeMessage {

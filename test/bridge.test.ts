@@ -9,6 +9,9 @@ import {
   fromUtf8,
   utf8,
   type PhoneMessage,
+  type Secret,
+  type SecretChanges,
+  type SecretInput,
 } from '../../wizzle-protocol/src/index.ts';
 import {
   SYSTEM_CONV,
@@ -114,6 +117,7 @@ test('sync answers with hello, agents, conversations, and the activity of a pend
   assert.equal(caps.createAgent, true);
   assert.equal(caps.streaming, false);
   assert.equal(caps.topics, false);
+  assert.equal(caps.clearSession, false);
   const agents = await t.phone.nextOf('agents');
   const list = agents.header.agents as Array<{ id: string; model?: string }>;
   assert.deepEqual(list.map((a) => a.id), ['g1', 'g2', 'system']);
@@ -124,6 +128,32 @@ test('sync answers with hello, agents, conversations, and the activity of a pend
   assert.equal(convs[1]?.lastAt, 1700000000000);
   const activity = await t.phone.nextOf('activity');
   assert.deepEqual(activity.header.activity, { conv: 'wizzle:agent:g2', state: 'tool', tool: 'Bash' });
+  t.bridge.stop();
+});
+
+test('the catalog carries the newest agent message of each conversation\'s history page', async () => {
+  const built = fakeHost();
+  built.host.history = async (conv, limit) => {
+    assert.equal(limit, 50);
+    if (conv === 'wizzle:agent:g2') throw new Error('mailbox gone');
+    return {
+      messages: [
+        { conv, msgId: 'a1', role: 'agent', text: 'first', format: 'markdown', at: 2000 },
+        { conv, msgId: 'u1', role: 'user', text: 'later', format: 'text', at: 3000 },
+        { conv, msgId: 'a0', role: 'agent', text: 'older', format: 'markdown', at: 1000 },
+      ],
+      hasMore: false,
+    };
+  };
+  const t = await paired(built);
+  t.phone.send({ t: 'sync' });
+  const conversations = await t.phone.nextOf('conversations');
+  const convs = conversations.header.conversations as Array<{ id: string; lastAgentAt?: number }>;
+  assert.deepEqual(convs.map((c) => [c.id, c.lastAgentAt]), [
+    ['wizzle:agent:g1', 2000],
+    ['wizzle:agent:g2', undefined],
+    [SYSTEM_CONV, undefined],
+  ]);
   t.bridge.stop();
 });
 
@@ -520,6 +550,7 @@ function topicHost() {
     { conv: 'wizzle:agent:g2', agentId: 'g2', title: 'Ops', topic: false, lastAt: 1700000000000 },
   ];
   const find = (conv: string) => convs.find((c) => c.conv === conv);
+  const cleared: string[] = [];
   const host: BridgeHost = {
     ...base.host,
     listConversations: async () => convs.map((c) => ({ ...c })),
@@ -546,8 +577,15 @@ function topicHost() {
       convs.splice(convs.indexOf(found), 1);
       return { questionIds: ['q1'] };
     },
+    clearConversation: async (conv) => {
+      const found = find(conv);
+      if (!found) throw coded('unknown_conv', 'No such conversation');
+      if (found.agentId === 'g2') throw coded('has_tasks', 'This chat holds 1 scheduled task');
+      cleared.push(conv);
+      return { questionIds: ['q2'] };
+    },
   };
-  return { host, agents: base.agents, convs };
+  return { host, agents: base.agents, convs, cleared };
 }
 
 test('topics are unsupported when the host has no conversation methods', async () => {
@@ -559,6 +597,8 @@ test('topics are unsupported when the host has no conversation methods', async (
   t.phone.send({ t: 'rename_conversation', conv: 'wizzle:agent:g1', title: 'Plans' });
   assert.equal((await t.phone.nextOf('error')).header.code, 'unsupported');
   t.phone.send({ t: 'delete_conversation', conv: 'wizzle:agent:g1' });
+  assert.equal((await t.phone.nextOf('error')).header.code, 'unsupported');
+  t.phone.send({ t: 'clear', conv: 'wizzle:agent:g1' });
   assert.equal((await t.phone.nextOf('error')).header.code, 'unsupported');
   t.bridge.stop();
 });
@@ -655,6 +695,35 @@ test('topic requests are validated and host codes pass through with the ref', as
   t.phone.send({ t: 'delete_conversation', conv: SYSTEM_CONV });
   assert.equal((await t.phone.nextOf('error')).header.code, 'read_only');
   t.phone.send({ t: 'delete_conversation', conv: 'wizzle:agent:g1:missing' });
+  assert.equal((await t.phone.nextOf('error')).header.code, 'unknown_conv');
+  t.bridge.stop();
+});
+
+test('clear keeps the conversation, closes its questions and passes host codes through', async () => {
+  const built = topicHost();
+  const t = await paired(built);
+  t.phone.send({ t: 'sync' });
+  const hello = await t.phone.nextOf('hello');
+  assert.equal((hello.header.capabilities as Record<string, boolean>).clearSession, true);
+  await t.phone.nextOf('conversations');
+
+  t.phone.send({ t: 'clear', conv: 'wizzle:agent:g1' });
+  const resolved = await t.phone.nextOf('question_resolved');
+  assert.equal(resolved.header.questionId, 'q2');
+  const session = await t.phone.nextOf('session');
+  assert.equal(session.header.conv, 'wizzle:agent:g1');
+  assert.equal(session.header.event, 'cleared');
+  const catalog = await t.phone.nextOf('conversations');
+  assert.ok((catalog.header.conversations as Array<{ id: string }>).some((c) => c.id === 'wizzle:agent:g1'));
+  assert.deepEqual(built.cleared, ['wizzle:agent:g1']);
+
+  t.phone.send({ t: 'clear', conv: 'wizzle:agent:g2', id: 'c1' });
+  const refused = await t.phone.nextOf('error');
+  assert.equal(refused.header.code, 'has_tasks');
+  assert.equal(refused.header.ref, 'c1');
+  t.phone.send({ t: 'clear', conv: SYSTEM_CONV });
+  assert.equal((await t.phone.nextOf('error')).header.code, 'read_only');
+  t.phone.send({ t: 'clear', conv: 'wizzle:agent:g1:missing' });
   assert.equal((await t.phone.nextOf('error')).header.code, 'unknown_conv');
   t.bridge.stop();
 });
@@ -820,5 +889,149 @@ test('delete emits agent_deleted, then a catalog without the agent or its topics
 
   t.phone.send({ t: 'send', conv: 'wizzle:agent:g1', msgId: 'm1', text: 'hello' });
   assert.equal((await t.phone.nextOf('error')).header.code, 'unknown_conv');
+  t.bridge.stop();
+});
+
+function keyHost() {
+  const built = fakeHost();
+  const vault: Secret[] = [{ id: 's1', name: 'GitHub', type: 'generic', host: 'api.github.com', injection: { headerName: 'Authorization', valueFormat: 'Bearer {value}' } }];
+  const grants = new Map<string, Set<string>>([['g1', new Set(['s1'])]]);
+  const values = new Map<string, string>([['s1', 'ghp_old']]);
+  Object.assign(built.host, {
+    listSecrets: async () => vault.map((secret) => ({ ...secret })),
+    createSecret: async (input: SecretInput) => {
+      if (input.host.includes('://')) throw coded('bad_request', 'Enter a hostname, not a URL');
+      const { value, ...shown } = input;
+      const secret: Secret = { id: `s${vault.length + 1}`, ...shown };
+      vault.push(secret);
+      values.set(secret.id, value);
+      return secret;
+    },
+    updateSecret: async (secretId: string, changes: SecretChanges) => {
+      const secret = vault.find((one) => one.id === secretId);
+      if (!secret) throw coded('unknown_secret', 'No such key');
+      if (changes.value !== undefined) values.set(secretId, changes.value);
+      if (changes.name !== undefined) secret.name = changes.name;
+      if (changes.path === null) delete secret.path;
+      return { ...secret };
+    },
+    deleteSecret: async (secretId: string) => {
+      const at = vault.findIndex((one) => one.id === secretId);
+      if (at === -1) throw coded('unknown_secret', 'No such key');
+      vault.splice(at, 1);
+    },
+    listAgentSecrets: async (agentId: string) => [...(grants.get(agentId) ?? [])],
+    attachSecret: async (agentId: string, secretId: string) => {
+      if (!vault.some((one) => one.id === secretId)) throw coded('unknown_secret', 'No such key');
+      grants.set(agentId, new Set([...(grants.get(agentId) ?? []), secretId]));
+    },
+    detachSecret: async (agentId: string, secretId: string) => void grants.get(agentId)?.delete(secretId),
+  });
+  return { ...built, vault, grants, values };
+}
+
+test('keys are unsupported without the host methods, and a create with keys is refused', async () => {
+  const t = await paired();
+  t.phone.send({ t: 'sync' });
+  assert.equal((((await t.phone.nextOf('hello')).header.capabilities) as Record<string, boolean>).keys, false);
+  for (const packet of [
+    { t: 'secrets' },
+    { t: 'delete_secret', secretId: 's1' },
+    { t: 'agent_secrets', agentId: 'g1' },
+    { t: 'attach_secret', agentId: 'g1', secretId: 's1' },
+  ] as PhoneMessage[]) {
+    t.phone.send({ ...packet, id: 'u1' });
+    const refused = await t.phone.nextOf('error');
+    assert.equal(refused.header.code, 'unsupported');
+    assert.equal(refused.header.ref, 'u1');
+  }
+  t.phone.send({ t: 'create_agent', name: 'Scout', secrets: ['s1'] });
+  assert.equal((await t.phone.nextOf('error')).header.code, 'unsupported');
+  t.bridge.stop();
+});
+
+test('the vault is listed, and every change answers the asker and reaches every phone', async () => {
+  const built = keyHost();
+  const t = await paired(built);
+  const seen: string[] = [];
+  const next = t.phone.next.bind(t.phone);
+  t.phone.next = async () => {
+    const packet = await next();
+    seen.push(JSON.stringify(packet.header));
+    return packet;
+  };
+  t.phone.send({ t: 'sync' });
+  assert.equal((((await t.phone.nextOf('hello')).header.capabilities) as Record<string, boolean>).keys, true);
+  t.phone.send({ t: 'secrets' });
+  assert.deepEqual((await t.phone.nextOf('secrets')).header.secrets, built.vault);
+
+  const input: SecretInput = { name: 'Bot', type: 'generic', host: 'api.telegram.org', injection: { pathTemplate: '/bot{value}' }, value: '123:abc ' };
+  t.phone.send({ t: 'create_secret', secret: input, id: 'c1' });
+  const saved = await t.phone.nextOf('secret');
+  assert.equal(saved.header.ref, 'c1');
+  assert.deepEqual(saved.header.secret, { id: 's2', name: 'Bot', type: 'generic', host: 'api.telegram.org', injection: { pathTemplate: '/bot{value}' } });
+  assert.equal(built.values.get('s2'), '123:abc ');
+  assert.deepEqual(((await t.phone.nextOf('secrets')).header.secrets as Secret[]).map((s) => s.id), ['s1', 's2']);
+
+  t.phone.send({ t: 'update_secret', secretId: 's1', changes: { name: 'GitHub main', value: 'ghp_new' }, id: 'c2' });
+  const updated = await t.phone.nextOf('secret');
+  assert.equal(updated.header.ref, 'c2');
+  assert.equal((updated.header.secret as Secret).name, 'GitHub main');
+  assert.equal(built.values.get('s1'), 'ghp_new');
+  await t.phone.nextOf('secrets');
+
+  t.phone.send({ t: 'delete_secret', secretId: 's2' });
+  assert.equal((await t.phone.nextOf('secret_deleted')).header.secretId, 's2');
+  assert.deepEqual(((await t.phone.nextOf('secrets')).header.secrets as Secret[]).map((s) => s.id), ['s1']);
+  assert.equal(seen.some((header) => header.includes('ghp_new') || header.includes('123:abc')), false);
+  t.bridge.stop();
+});
+
+test('key requests are validated before the host is called, and host codes come back with the ref', async () => {
+  const built = keyHost();
+  const t = await paired(built);
+  const refusals: Array<[PhoneMessage, string]> = [
+    [{ t: 'create_secret', secret: { name: 'X', type: 'generic', host: 'a.com', value: '' } }, 'bad_request'],
+    [{ t: 'create_secret', secret: { name: 'X', type: 'other' as never, host: 'a.com', value: 'v' } }, 'bad_request'],
+    [{ t: 'create_secret', secret: { name: 'X', type: 'generic', host: 'a.com', value: 'v', injection: { headerName: 'A', paramName: 'b' } as never } }, 'bad_request'],
+    [{ t: 'update_secret', secretId: 's1', changes: {} }, 'bad_request'],
+    [{ t: 'update_secret', secretId: ' ', changes: { name: 'Y' } }, 'bad_request'],
+    [{ t: 'update_secret', secretId: 's1', changes: { injection: { pathRegex: '^/x' } as never } }, 'bad_request'],
+    [{ t: 'create_secret', secret: { name: 'X', type: 'generic', host: 'https://a.com', value: 'v', injection: { paramName: 'key' } } }, 'bad_request'],
+    [{ t: 'delete_secret', secretId: 's9' }, 'unknown_secret'],
+    [{ t: 'agent_secrets', agentId: 'system' }, 'bad_request'],
+    [{ t: 'agent_secrets', agentId: 'g9' }, 'unknown_agent'],
+    [{ t: 'attach_secret', agentId: 'g1' } as never, 'bad_request'],
+    [{ t: 'attach_secret', agentId: 'g2', secretId: 's9' }, 'unknown_secret'],
+    [{ t: 'create_agent', name: 'Scout', secrets: ['s1', 3] as never }, 'bad_request'],
+  ];
+  for (const [packet, code] of refusals) {
+    t.phone.send({ ...packet, id: 'v1' });
+    const refused = await t.phone.nextOf('error');
+    assert.equal(refused.header.code, code, JSON.stringify(packet));
+    assert.equal(refused.header.ref, 'v1');
+  }
+  assert.equal(built.vault.length, 1);
+  assert.equal(built.requests.length, 0);
+  t.bridge.stop();
+});
+
+test('an agent\'s keys are listed, attached and detached, and a create carries the picked keys', async () => {
+  const built = keyHost();
+  const t = await paired(built);
+  t.phone.send({ t: 'agent_secrets', agentId: 'g2' });
+  const listed = await t.phone.nextOf('agent_secrets');
+  assert.equal(listed.header.agentId, 'g2');
+  assert.deepEqual(listed.header.secretIds, []);
+  t.phone.send({ t: 'attach_secret', agentId: 'g2', secretId: 's1' });
+  const attached = await t.phone.nextOf('agent_secrets');
+  assert.equal(attached.header.agentId, 'g2');
+  assert.deepEqual(attached.header.secretIds, ['s1']);
+  t.phone.send({ t: 'detach_secret', agentId: 'g1', secretId: 's1' });
+  assert.deepEqual((await t.phone.nextOf('agent_secrets')).header.secretIds, []);
+
+  t.phone.send({ t: 'create_agent', name: 'Scout', template: 'sales/sdr', secrets: [' s1 ', 's1', 's2'] });
+  await t.phone.nextOf('agent');
+  assert.deepEqual(built.requests[0], { name: 'Scout', template: 'sales/sdr', secrets: ['s1', 's2'] });
   t.bridge.stop();
 });
