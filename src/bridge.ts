@@ -54,7 +54,7 @@ export type HostActivity = { running: boolean; tool?: string; toolStartedAt?: nu
 export type HostQuestion = { title: string; question?: string; options: QuestionOption[] };
 export type HostConversation = { conv: string; agentId: string; title: string; lastAt?: number; topic: boolean; createdAt?: number };
 export type HostDeleted = { questionIds?: string[] };
-// Everything the phone can put in one create_agent, already validated by the bridge.
+// Everything wizzle can put in one create_agent, already validated by the bridge.
 export type HostCreateAgent = { name: string; purpose?: string; template?: string; copyFrom?: string; timezone?: string; secrets?: string[] };
 
 // What the bridge needs from the runtime. The NanoClaw adapter implements it on the host DB.
@@ -74,7 +74,7 @@ export interface BridgeHost {
   deleteConversation?(conv: string): Promise<HostDeleted | void>;
   // Drops the conversation's session, so its history and the agent's context go and the conversation stays.
   clearConversation?(conv: string): Promise<HostDeleted | void>;
-  // Pause answers with the open questions it cancelled, so the phone can close them.
+  // Pause answers with the open questions it cancelled, so wizzle can close them.
   pauseAgent?(agentId: string): Promise<HostDeleted | void>;
   resumeAgent?(agentId: string): Promise<void>;
   restartAgent?(agentId: string, message?: string): Promise<void>;
@@ -90,7 +90,7 @@ export interface BridgeHost {
 }
 
 export type InboundAttachment = { name: string; mimeType: string; size: number; data: string };
-// msgId is the phone's own id for the message, kept so history can hand it back.
+// msgId is wizzle's own id for the message, kept so history can hand it back.
 export type InboundText = { id: string; msgId: string; text: string; attachments?: InboundAttachment[] };
 
 // Callbacks into the runtime's inbound path, filled in by the adapter's setup().
@@ -225,7 +225,7 @@ export class WizzleBridge {
     return link.client;
   }
 
-  // With revoke the relay forgets the pairing and the phone is cut off; without it only this side stops.
+  // With revoke the relay forgets the pairing and wizzle is cut off; without it only this side stops.
   removePairing(id: string, revoke: boolean): void {
     const link = this.links.get(id);
     if (!link) return;
@@ -288,7 +288,7 @@ export class WizzleBridge {
       this.questionConv.set(questionId, conv);
       emit({ t: 'question', question });
       finishTurn();
-      this.wakePhone();
+      this.wakeWizzle();
       return questionId;
     }
 
@@ -342,23 +342,23 @@ export class WizzleBridge {
     });
 
     if (firstId !== undefined) finishTurn();
-    if (wake) this.wakePhone();
+    if (wake) this.wakeWizzle();
     return firstId;
   }
 
-  // A host authored line in one conversation. The phone shows it as a system row.
+  // A host authored line in one conversation. wizzle shows it as a system row.
   notify(conv: string, text: string): void {
     const message: ChatMessage = { conv, msgId: randomUUID(), role: 'system', text, format: 'text', at: Date.now() };
     this.broadcast({ t: 'message', message, id: randomUUID() });
-    this.wakePhone();
+    this.wakeWizzle();
   }
 
-  // One push request per link whose phone is away; the relay decides whether to push.
-  private wakePhone(): void {
+  // One push request per link whose wizzle is away; the relay decides whether to push.
+  private wakeWizzle(): void {
     for (const link of this.links.values()) if (!link.client.peerOnline) link.client.requestPush();
   }
 
-  // Runtime typing signal. Only sent while a phone is online, and only when it changes.
+  // Runtime typing signal. Only sent while wizzle is online, and only when it changes.
   async typing(conv: string, status?: string, statusKind?: 'auto' | 'agent'): Promise<void> {
     if (!this.awaiting.has(conv) && statusKind !== 'agent') return;
     if (!this.peerOnline) return;
@@ -377,7 +377,7 @@ export class WizzleBridge {
     this.armSilence(conv);
   }
 
-  // Only an activity that reached a phone counts as sent, so a repeat after a reconnect is not swallowed.
+  // Only an activity that reached wizzle counts as sent, so a repeat after a reconnect is not swallowed.
   private sendActivity(activity: Activity): void {
     if (!this.peerOnline) return;
     const key = JSON.stringify(activity);
@@ -468,7 +468,7 @@ export class WizzleBridge {
     this.reply(link, { t: 'conversations', conversations });
   }
 
-  // Read from the page a phone's history request gets, so a phone holding that page never needs to ask again.
+  // Read from the page wizzle's history request gets, so wizzle holding that page never needs to ask again.
   private async lastAgentAt(conv: string): Promise<number | undefined> {
     let messages: ChatMessage[];
     try {
@@ -491,7 +491,7 @@ export class WizzleBridge {
     try {
       decoded = decodePacket(plaintext);
     } catch (err) {
-      this.log.warn('wizzle: malformed packet from phone', { err });
+      this.log.warn('wizzle: malformed packet from the wizzle app', { err });
       return;
     }
     const { header, body } = decoded;
@@ -644,7 +644,7 @@ export class WizzleBridge {
           this.fail(link, ref, 'bad_request', 'create_agent needs a name');
           return;
         }
-        // `description` is what an older phone calls the purpose.
+        // `description` is what an older wizzle app calls the purpose.
         const rawPurpose = optionalText(header.purpose) ?? optionalText(header.description);
         if (rawPurpose !== undefined && rawPurpose.length > MAX_PURPOSE_CHARS) {
           this.fail(link, ref, 'too_long', `A purpose is at most ${MAX_PURPOSE_CHARS} characters`);
@@ -984,7 +984,7 @@ export class WizzleBridge {
     }
   }
 
-  // Every phone sees the vault change; a listing that fails here leaves the phones' copy until they ask again.
+  // Every wizzle app sees the vault change; a listing that fails here leaves their copy until they ask again.
   private async broadcastSecrets(): Promise<void> {
     try {
       this.broadcast({ t: 'secrets', secrets: (await this.host.listSecrets?.()) ?? [], id: randomUUID() });
@@ -993,7 +993,7 @@ export class WizzleBridge {
     }
   }
 
-  // Checks the capability and the agent for a lifecycle packet; answers the phone itself on a refusal.
+  // Checks the capability and the agent for a lifecycle packet; answers wizzle itself on a refusal.
   private async lifecycleTarget(link: Link, ref: string | undefined, t: string, agentId: unknown): Promise<HostAgent | null> {
     const methods: Record<string, unknown> = {
       pause_agent: this.host.pauseAgent,

@@ -19,15 +19,15 @@ const taskEcho = row('msg-1:echo:sess-chat', '2026-10-22T14:01:02.364Z', {
 });
 const siblingEcho = row('msg-2:echo:sess-chat', '2026-10-22T15:00:00.000Z', {
   text: 'said in another thread',
-  sender: 'Phone',
+  sender: 'Wizzle',
   senderId: 'wizzle:owner',
   echo: { surface: 'dm-thread', label: 'another thread' },
 });
-const phone = row('in-1', '2026-10-22T13:00:00.000Z', { text: 'What is today', sender: 'Phone', senderId: 'wizzle:owner', msgId: 'p1' });
+const wizzle = row('in-1', '2026-10-22T13:00:00.000Z', { text: 'What is today', sender: 'Wizzle', senderId: 'wizzle:owner', msgId: 'p1' });
 const note = row('in-2', '2026-10-22T13:30:00.000Z', { text: 'Agent paused', sender: 'system', senderId: 'system' });
 
 test('only task delivery echoes name an original', () => {
-  assert.deepEqual(taskEchoOrigins([phone, taskEcho, siblingEcho, note]), ['msg-1']);
+  assert.deepEqual(taskEchoOrigins([wizzle, taskEcho, siblingEcho, note]), ['msg-1']);
 });
 
 test('a task delivery echo is the agent message under its original id and full text', () => {
@@ -45,10 +45,10 @@ test('without its original the echo text stands in, still as the agent', () => {
   assert.equal(message?.text.endsWith('…'), true);
 });
 
-test('other echoes are left out and the phone, system and agent rows keep their roles', () => {
+test('other echoes are left out and wizzle, system and agent rows keep their roles', () => {
   const reply = row('out-1', '2026-10-22T13:00:05.000Z', { text: 'Here it is' });
   const edit = row('out-2', '2026-10-22T13:00:06.000Z', { text: 'Here it is!', operation: 'edit' });
-  const messages = historyMessages(CONV, [siblingEcho, note, phone], [edit, reply], new Map());
+  const messages = historyMessages(CONV, [siblingEcho, note, wizzle], [edit, reply], new Map());
   assert.deepEqual(
     messages.map((m) => [m.msgId, m.role, m.text]),
     [

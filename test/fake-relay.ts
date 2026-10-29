@@ -16,7 +16,7 @@ import {
   toB64Url,
   type DecodedPacket,
   type KeyPair,
-  type PhoneMessage,
+  type WizzleMessage,
   type RelayControl,
   type Role,
   type SessionKeys,
@@ -28,13 +28,13 @@ import type { Transport, TransportConn, TransportHandlers } from '../src/transpo
 type Client = { role: Role | null; handlers: TransportHandlers; open: boolean };
 
 function other(role: Role): Role {
-  return role === 'phone' ? 'bridge' : 'phone';
+  return role === 'wizzle' ? 'bridge' : 'wizzle';
 }
 
 // In-process stand-in for the relay: hello/welcome, peer notices, buffering while a side is offline.
 export class FakeRelay {
   private readonly clients = new Map<Role, Client>();
-  private readonly buffered: Record<Role, Uint8Array[]> = { phone: [], bridge: [] };
+  private readonly buffered: Record<Role, Uint8Array[]> = { wizzle: [], bridge: [] };
   connections = 0;
   expectedSecret: string | null = null;
   readonly hellos: string[] = [];
@@ -157,8 +157,8 @@ export class FakeRelay {
   }
 }
 
-// Minimal phone: pairs, seals packets, records what the bridge sends.
-export class FakePhone {
+// Minimal wizzle: pairs, seals packets, records what the bridge sends.
+export class FakeWizzle {
   readonly session: Session;
   readonly received: DecodedPacket[] = [];
   readonly control: RelayControl[] = [];
@@ -172,12 +172,12 @@ export class FakePhone {
   private welcomeWaiter: (() => void) | null = null;
   private confirmWaiter: (() => void) | null = null;
 
-  constructor(relay: FakeRelay, pairing: TestPairing, state?: SessionState, own: KeyPair = pairing.phone) {
+  constructor(relay: FakeRelay, pairing: TestPairing, state?: SessionState, own: KeyPair = pairing.wizzle) {
     this.relay = relay;
     this.pairingId = pairing.pairingId;
     this.relaySecret = deriveRelaySecret(nodeCrypto, pairing.secret);
     const keys = { psk: derivePsk(nodeCrypto, pairing.secret), own, peer: pairing.bridge.publicKey };
-    this.session = new Session(nodeCrypto, 'phone', pairing.pairingId, keys, state);
+    this.session = new Session(nodeCrypto, 'wizzle', pairing.pairingId, keys, state);
   }
 
   connect(): Promise<void> {
@@ -186,7 +186,7 @@ export class FakePhone {
       this.conn = this.relay.transport.connect('fake', {
         onOpen: () => {
           this.conn?.sendText(
-            encodeControl({ t: 'hello', v: RELAY_PROTOCOL_VERSION, pairing: toB64Url(this.pairingId), role: 'phone', secret: toB64Url(this.relaySecret) }),
+            encodeControl({ t: 'hello', v: RELAY_PROTOCOL_VERSION, pairing: toB64Url(this.pairingId), role: 'wizzle', secret: toB64Url(this.relaySecret) }),
           );
         },
         onText: (text) => {
@@ -221,7 +221,7 @@ export class FakePhone {
     });
   }
 
-  send(packet: PhoneMessage & { id?: string }, body?: Uint8Array): void {
+  send(packet: WizzleMessage & { id?: string }, body?: Uint8Array): void {
     const withId = { id: packet.id ?? `p-${this.dataFrames}-${Date.now()}`, ...packet };
     this.conn?.sendBinary(this.session.seal(encodePacket(withId, body)));
   }
@@ -287,13 +287,13 @@ export async function until(check: () => boolean, timeoutMs = 2000): Promise<voi
   }
 }
 
-export type TestPairing = { pairingId: Uint8Array; secret: Uint8Array; bridge: KeyPair; phone: KeyPair };
+export type TestPairing = { pairingId: Uint8Array; secret: Uint8Array; bridge: KeyPair; wizzle: KeyPair };
 
 export function newPairing(): TestPairing {
-  return { pairingId: nodeCrypto.randomBytes(16), secret: nodeCrypto.randomBytes(32), bridge: nodeCrypto.x25519KeyPair(), phone: nodeCrypto.x25519KeyPair() };
+  return { pairingId: nodeCrypto.randomBytes(16), secret: nodeCrypto.randomBytes(32), bridge: nodeCrypto.x25519KeyPair(), wizzle: nodeCrypto.x25519KeyPair() };
 }
 
-// The bridge side's session keys before a phone is pinned.
+// The bridge side's session keys before wizzle is pinned.
 export function bridgeKeys(pairing: TestPairing, pinned: Uint8Array | null = null): SessionKeys {
   return { psk: derivePsk(nodeCrypto, pairing.secret), own: pairing.bridge, peer: pinned };
 }

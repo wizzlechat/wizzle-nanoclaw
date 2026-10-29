@@ -26,16 +26,16 @@ test('pairing round trip with private file modes', () => {
   assert.deepEqual(fs.readdirSync(store.dir), ['pairing.json']);
 });
 
-test('markPaired pins the phone key once', () => {
+test('markPaired pins wizzle key once', () => {
   const store = tempStore();
-  store.markPaired('phone');
+  store.markPaired('wizzle');
   assert.equal(store.loadPairing(), null);
   store.savePairing(RECORD);
-  store.markPaired('phone');
+  store.markPaired('wizzle');
   const first = store.loadPairing();
   assert.ok(first?.pairedAt);
-  assert.equal(first?.phoneKey, 'phone');
-  store.markPaired('phone');
+  assert.equal(first?.wizzleKey, 'wizzle');
+  store.markPaired('wizzle');
   assert.equal(store.loadPairing()?.pairedAt, first?.pairedAt);
 });
 

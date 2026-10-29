@@ -1,6 +1,6 @@
 # wizzle-nanoclaw
 
-The NanoClaw side of wizzle: a channel adapter that pairs one phone to a
+The NanoClaw side of wizzle: a channel adapter that pairs one wizzle app to a
 NanoClaw install through the wizzle relay. Zero dependencies beyond Node 22
 (global `WebSocket`, `node:crypto`).
 
@@ -9,26 +9,26 @@ NanoClaw install through the wizzle relay. Zero dependencies beyond Node 22
 - `src/relay-client.ts`: one relay connection per pairing. Sends `hello`,
   reconnects with backoff, runs the handshake, seals packets, keeps an outbox
   of unacked frames and resends it after every reconnect and whenever the
-  relay reports the phone back online (the phone drops repeats). Session
+  relay reports wizzle back online (wizzle drops repeats). Session
   state is persisted before a frame leaves so a crash never reuses a nonce.
-  Once a phone is pinned it says `hello` with the paired relay secret, falls
+  Once wizzle is pinned it says `hello` with the paired relay secret, falls
   back to the invite's secret when the relay refuses it, and sends `rekey`
   whenever it is attached with the invite's secret. `revoke()` makes the
   relay forget the pairing.
 - `src/pairing.ts`: the pairing lifecycle (`PairingManager`). Issues one-time
-  invites with a fresh static key and an expiry, pins the first phone that
+  invites with a fresh static key and an expiry, pins the first wizzle app that
   completes a handshake, revokes an invite nobody scanned in time, forgets the
-  pairing when the phone removes the bridge, and resumes all of it from disk.
+  pairing when wizzle removes the bridge, and resumes all of it from disk.
   Also `isRelayUrl`, `inviteText` (the QR plus the URL), `DEFAULT_RELAY_URL`.
 - `src/bridge.ts`: runtime agnostic core. Takes a `BridgeHost` (how to list
   agents, read history, read activity, render a question, create an agent)
-  and `BridgeHooks` (how to hand a phone message or an answer to the runtime).
-  Maps runtime output (`deliver`) to protocol packets and phone packets to host
+  and `BridgeHooks` (how to hand a wizzle message or an answer to the runtime).
+  Maps runtime output (`deliver`) to protocol packets and wizzle packets to host
   calls. Fixed `wizzle:system` System conversation for host initiated cards
   such as approvals. A conversation wired after the last catalog was sent is
-  announced to the phone before its first message.
+  announced to wizzle before its first message.
 - `src/store.ts`: `pairing.json` (relay, pairing id, secret, the bridge's
-  static key pair, the invite expiry, the pinned phone key), `session.json`,
+  static key pair, the invite expiry, the pinned wizzle key), `session.json`,
   and the pending `invite.txt` under a 0700 directory, 0600 files, atomic
   writes. A `pairing.json` from before static keys reads as no pairing.
 - `src/qr.ts`: dependency free QR encoder (byte mode, versions 1 to 10,
@@ -50,21 +50,21 @@ NanoClaw install through the wizzle relay. Zero dependencies beyond Node 22
 - Pairing: `ncl wizzle pair` (host only, hidden from agents) creates a pairing
   and prints a QR code plus the `wizzle://pair?...` invite in the operator's
   terminal; the same text goes to `data/wizzle/invite.txt` and stdout. With a
-  phone paired it refuses; `ncl wizzle pair --replace` revokes that phone at
-  the relay first. The first phone to complete a handshake is pinned, the relay
+  wizzle app paired it refuses; `ncl wizzle pair --replace` revokes that app at
+  the relay first. The first wizzle app to complete a handshake is pinned, the relay
   is told to swap the invite's secret for the paired one, and the invite file
   is removed. An invite nobody scans is revoked at expiry and forgotten. When
-  the phone removes the bridge the relay sends `revoked` and the bridge forgets
+  wizzle removes the bridge the relay sends `revoked` and the bridge forgets
   the pairing. Nothing pairs at startup on its own: a restart resumes a paired
-  phone, re-announces a pending invite, or drops an expired one.
+  wizzle, re-announces a pending invite, or drops an expired one.
 - The bridge dials the configured relay URL. When it differs from the one the
-  phone paired with it logs a warning, since the phone has to pair again.
+  wizzle app paired with it logs a warning, since the app has to pair again.
 - Each agent group's conversation is the wizzle messaging group wired to it.
-  NanoClaw's channel setup wires `wizzle:phone` to the first agent (the skill
-  resolves `owner_handle` as `owner` and `platform_id` as `wizzle:phone`).
+  NanoClaw's channel setup wires `wizzle:wizzle` to the first agent (the skill
+  resolves `owner_handle` as `owner` and `platform_id` as `wizzle:wizzle`).
   Agents without a wiring get one at adapter setup, created with the same host
   commands the CLI uses (`messaging-groups-create`, `wirings-create`):
-  platform id `wizzle:agent:<agentGroupId>`, instance `wizzle`, name `Phone`.
+  platform id `wizzle:agent:<agentGroupId>`, instance `wizzle`, name `Wizzle`.
   The owner user is `wizzle:owner`.
 - Topics: an agent can hold more conversations than its default one. A topic is
   another wizzle messaging group, platform id
@@ -80,10 +80,10 @@ NanoClaw install through the wizzle relay. Zero dependencies beyond Node 22
   removes the session, then the wirings, then the group, in that order, since
   the schema has foreign keys on and no cascade. The default conversation and
   `wizzle:system` cannot be renamed or deleted.
-- Inbound phone messages become `chat` inbound messages with
-  `{ text, sender: 'Phone', senderId: 'wizzle:owner', msgId }` and base64
+- Inbound wizzle messages become `chat` inbound messages with
+  `{ text, sender: 'Wizzle', senderId: 'wizzle:owner', msgId }` and base64
   attachments that NanoClaw stages into the session inbox. `msgId` is the
-  phone's own id for the message, 1 to 64 characters of `[A-Za-z0-9_-]`;
+  wizzle's own id for the message, 1 to 64 characters of `[A-Za-z0-9_-]`;
   anything else is refused with `bad_request`.
 - Outbound: text and markdown become `message`, `ask_question` becomes
   `question` (rendered through the question render registry), edits with a
@@ -96,34 +96,34 @@ NanoClaw install through the wizzle relay. Zero dependencies beyond Node 22
   patched core.
 - Push wake: after `deliver` emitted a `message`, `question`, `card` or
   `file`, and after `notify`, the bridge sends the relay one `wake` control
-  message per pairing whose phone is offline; the relay turns it into a push.
+  message per pairing whose wizzle is offline; the relay turns it into a push.
   While the relay is not attached the wake is held and sent after the next
-  `welcome` if the phone is still offline. Never for edits, reactions,
+  `welcome` if wizzle is still offline. Never for edits, reactions,
   `question_resolved`, activity, catalog or history replies, or errors.
 - Typing: activity packets (`thinking` or `tool` with the current tool from
-  the mailbox container state) only while a reply is pending and a phone is
-  online, deduplicated against what actually reached the phone. A pending
+  the mailbox container state) only while a reply is pending and wizzle is
+  online, deduplicated against what actually reached wizzle. A pending
   check after the mailbox read drops a `thinking` that would land after the
   reply. `sync` reports activity only for replies still pending, never for an
   idle running container. Twelve seconds without a typing refresh sends
   `idle`, which covers a turn that ends with only a reaction or an edit. The
-  phone clears all activity when a new connection's `hello` arrives.
+  wizzle clears all activity when a new connection's `hello` arrives.
 - History: inbound chat plus outbound text from the session mailbox, merged
   by timestamp, capped at 200 per request. An inbound row's `msgId` is the
-  `msgId` in its content (the phone's id), else the row id; an outbound row's
-  is the row id, so it matches what the phone saw live. Outbound rows whose
+  `msgId` in its content (wizzle's id), else the row id; an outbound row's
+  is the row id, so it matches what wizzle saw live. Outbound rows whose
   content has an `operation` (edits, reactions) are skipped. A core without
   the row id in its history reads falls back to the old `in-`/`out-`
   timestamp ids.
 - Approvals: NanoClaw delivers approval cards as `ask_question` to the
-  approver's DM, which `openDM` maps to the `wizzle:system` conversation. The phone
+  approver's DM, which `openDM` maps to the `wizzle:system` conversation. wizzle
   sees them as `question` packets there; `answer` and `resolve` both reach
   the host's `onAction`. The protocol's `approval` packet is unused for now.
 - Lifecycle: `pause_agent`, `resume_agent` and `restart_agent` reach the
   host's `pauseAgent`, `resumeAgent` and `restartAgent`, which call the fork's
   `groups-pause`, `groups-resume` and `groups-restart` (never with rebuild).
   Pause also clears the agent's open questions and approvals, since an answer
-  would wake it, and the bridge closes them on the phone. A paused agent lists
+  would wake it, and the bridge closes them in wizzle. A paused agent lists
   as `paused`, which wins over running and idle. A send to it is refused with
   code `paused`, and a restart with `bad_request` until it is resumed.
   `groups-restart` only reaches running containers, so a restart message for an
@@ -134,7 +134,7 @@ NanoClaw install through the wizzle relay. Zero dependencies beyond Node 22
   seconds and resuming the group if it was running), clears pending questions
   and approvals, runs `groups-delete` (sessions, wirings, destinations), then
   deletes each wizzle messaging group of the agent left with no wiring, so a
-  `wizzle:phone` shared with another agent stays. Session mailboxes are not
+  `wizzle:wizzle` shared with another agent stays. Session mailboxes are not
   erased. With `removeWorkspace`, `groups/<folder>` and
   `data/v2-sessions/<id>` are renamed to `<name>.deleted-<timestamp>`; without
   it the folder stays, so re-creating the same name lands on a suffixed folder.
@@ -145,20 +145,20 @@ NanoClaw install through the wizzle relay. Zero dependencies beyond Node 22
   `/v1/secrets` (id, name, type, host and path pattern, injection; OneCLI never
   lists a value), `create_secret`, `update_secret` and `delete_secret` reach
   `POST`, `PATCH` and `DELETE` on it, and OneCLI's refusal text reaches the
-  phone as the error message. A save answers the asker with `secret` (its `ref`
-  is the request id) and every phone with the new `secrets`; a delete sends
+  wizzle as the error message. A save answers the asker with `secret` (its `ref`
+  is the request id) and wizzle with the new `secrets`; a delete sends
   `secret_deleted` first. `agent_secrets`, `attach_secret` and `detach_secret`
   use `/v1/agents/:id/grants`, where the OneCLI agent is the one whose
   identifier is the group id. A group only gets that agent on its first spawn,
   so attach creates it (409 means a spawn made it first) and the list of a group
-  without one is empty. Attach and detach answer every phone with the agent's
+  without one is empty. Attach and detach answer wizzle with the agent's
   new `agent_secrets`.
 - `create_agent` takes `secrets`, at most 64 ids. With OneCLI reachable, an id
   no longer in the vault is refused with `unknown_secret` before anything is
   created. After the group exists the keys are attached before onboarding, so
   the first spawn carries them. A key that does not attach, or OneCLI being down,
   never fails the create: the new agent's chat gets a system line naming the
-  keys, which the phone attaches later from the agent's Keys.
+  keys, which wizzle attaches later from the agent's Keys.
 - Templates: `templates` lists the installed templates (each folder of
   `templates/` with a `plugin.json`), then the public library's from
   `templates-list --registry`, which caches the index for five minutes. A
@@ -167,7 +167,7 @@ NanoClaw install through the wizzle relay. Zero dependencies beyond Node 22
   A create from a template runs `ensureTemplateLocal` first, which downloads a
   library template into `templates/<category>/<name>` and never overwrites a
   local copy, so a failed download creates nothing (`unknown_template`).
-- Capabilities advertised to the phone: questions, approvals, files, history,
+- Capabilities advertised to wizzle: questions, approvals, files, history,
   clearSession, createAgent, templates, topics, lifecycle, deleteAgent, and
   keys on a OneCLI install. Not yet: streaming, tasks, abort.
 
@@ -214,14 +214,14 @@ defined). The adapter works without them, with the fallbacks above.
 Two facts about the fork that the adapter had to work around: there is no
 `sessions-delete` CLI op, so a topic delete calls `deleteSession()` directly,
 and the owner wiring created by channel setup uses the platform id
-`wizzle:phone`, so the default conversation for the first agent is found by
+`wizzle:wizzle`, so the default conversation for the first agent is found by
 that id and not by the `wizzle:agent:` prefix.
 
 ## Checks
 
 `test/pairing.test.ts` drives `PairingManager` against the fake relay: a pairing
-end to end with the rekey, replacing a paired phone, expiry, resuming from disk,
-and the phone removing the bridge.
+end to end with the rekey, replacing a paired wizzle app, expiry, resuming from disk,
+and wizzle removing the bridge.
 
 ```
 node --test test/*.test.ts

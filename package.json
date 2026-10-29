@@ -1,7 +1,7 @@
 {
   "name": "wizzle-nanoclaw",
   "version": "0.1.0",
-  "description": "NanoClaw channel adapter that bridges agents to the wizzle phone app through the relay",
+  "description": "NanoClaw channel adapter that bridges agents to the wizzle app through the relay",
   "type": "module",
   "private": true,
   "scripts": {

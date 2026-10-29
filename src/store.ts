@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import type { SessionState } from '../../wizzle-protocol/src/index.ts';
 
-// Byte fields are base64url. expiresAt is the invite's unix seconds; phoneKey is set once a phone is pinned.
+// Byte fields are base64url. expiresAt is the invite's unix seconds; wizzleKey is set once wizzle is pinned.
 export type StoredPairing = {
   relay: string;
   pairingId: string;
@@ -15,7 +15,7 @@ export type StoredPairing = {
   runtime?: string;
   createdAt: string;
   pairedAt?: string;
-  phoneKey?: string;
+  wizzleKey?: string;
 };
 
 function readJson<T>(file: string): T | null {
@@ -80,10 +80,10 @@ export class BridgeStore {
     writeJson(this.pairingFile, pairing);
   }
 
-  markPaired(phoneKey: string): void {
+  markPaired(wizzleKey: string): void {
     const pairing = this.loadPairing();
-    if (!pairing || pairing.phoneKey === phoneKey) return;
-    this.savePairing({ ...pairing, pairedAt: new Date().toISOString(), phoneKey });
+    if (!pairing || pairing.wizzleKey === wizzleKey) return;
+    this.savePairing({ ...pairing, pairedAt: new Date().toISOString(), wizzleKey });
   }
 
   loadSession(): SessionState | null {
@@ -96,7 +96,7 @@ export class BridgeStore {
     writeJson(this.sessionFile, state);
   }
 
-  // The invite (QR plus URL) stays on disk until the phone pairs, so setup can show it.
+  // The invite (QR plus URL) stays on disk until wizzle pairs, so setup can show it.
   saveInvite(text: string): void {
     writeText(this.inviteFile, text);
   }

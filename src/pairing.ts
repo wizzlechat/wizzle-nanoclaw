@@ -35,7 +35,7 @@ export function inviteText(url: string, expiresAt: number): string {
   const minutes = Math.max(0, Math.round((expiresAt * 1000 - Date.now()) / 60_000));
   return [
     '',
-    'wizzle: scan this code with the wizzle app to pair your phone.',
+    'wizzle: scan this code with the wizzle app to pair it.',
     '',
     renderQr(encodeQr(url, { level: 'L' }), 'utf8'),
     '',
@@ -68,7 +68,7 @@ function coded(code: string, message: string): Error {
   return Object.assign(new Error(message), { code });
 }
 
-// The one pairing of this install: its invite and expiry, the pinned phone, and the secret the relay knows it by.
+// The one pairing of this install: its invite and expiry, the pinned wizzle, and the secret the relay knows it by.
 export class PairingManager {
   private readonly opts: PairingManagerOptions;
   private pairing: StoredPairing | null = null;
@@ -80,32 +80,32 @@ export class PairingManager {
 
   get state(): PairingState {
     if (!this.pairing) return 'none';
-    return this.pairing.phoneKey ? 'paired' : 'inviting';
+    return this.pairing.wizzleKey ? 'paired' : 'inviting';
   }
 
   // Resumes what is on disk. An invite nobody scanned in time is thrown away.
   start(): void {
     const stored = this.opts.store.loadPairing();
     if (!stored) return;
-    if (!stored.phoneKey && stored.expiresAt * 1000 <= this.now()) {
+    if (!stored.wizzleKey && stored.expiresAt * 1000 <= this.now()) {
       this.opts.store.clear();
       this.opts.log.info('wizzle: the pending invite expired, run ncl wizzle pair for a new one');
       return;
     }
     if (stored.relay !== this.opts.relay) {
-      this.opts.log.warn('wizzle: the relay URL changed since pairing, the phone still dials the old one; run ncl wizzle pair --replace', {
+      this.opts.log.warn('wizzle: the relay URL changed since pairing, wizzle still dials the old one; run ncl wizzle pair --replace', {
         paired: stored.relay,
         configured: this.opts.relay,
       });
     }
     this.open(stored);
-    if (!stored.phoneKey) this.opts.announce?.(this.inviteUrl(stored), stored.expiresAt);
+    if (!stored.wizzleKey) this.opts.announce?.(this.inviteUrl(stored), stored.expiresAt);
   }
 
-  // A new invite replaces a pending one; replacing a paired phone cuts it off, so that needs replace.
+  // A new invite replaces a pending one; replacing a paired wizzle app cuts it off, so that needs replace.
   issue(replace: boolean): IssuedInvite {
-    if (this.pairing?.phoneKey && !replace) {
-      throw coded('paired', 'A phone is already paired. Run ncl wizzle pair --replace to unpair it and show a new code.');
+    if (this.pairing?.wizzleKey && !replace) {
+      throw coded('paired', 'A wizzle app is already paired. Run ncl wizzle pair --replace to unpair it and show a new code.');
     }
     this.close(true);
     const { crypto } = this.opts;
@@ -166,7 +166,7 @@ export class PairingManager {
     const keys: SessionKeys = {
       psk: derivePsk(crypto, secret),
       own: { publicKey: fromB64Url(pairing.bridgePublic), privateKey: fromB64Url(pairing.bridgePrivate) },
-      peer: pairing.phoneKey ? fromB64Url(pairing.phoneKey) : null,
+      peer: pairing.wizzleKey ? fromB64Url(pairing.wizzleKey) : null,
     };
     let session: Session;
     try {
@@ -188,24 +188,24 @@ export class PairingManager {
       onFatal: (code) => this.fatal(code),
       ...(this.opts.reconnect && { reconnect: this.opts.reconnect }),
     });
-    if (!pairing.phoneKey) this.armExpiry();
+    if (!pairing.wizzleKey) this.armExpiry();
   }
 
   // Read from the stored pin, so the relay is only told to rekey once the pin is on disk.
   private pairedSecret(): Uint8Array | null {
     const pairing = this.pairing;
-    if (!pairing?.phoneKey) return null;
-    return derivePairedRelaySecret(this.opts.crypto, fromB64Url(pairing.pairingId), fromB64Url(pairing.bridgePrivate), fromB64Url(pairing.phoneKey));
+    if (!pairing?.wizzleKey) return null;
+    return derivePairedRelaySecret(this.opts.crypto, fromB64Url(pairing.pairingId), fromB64Url(pairing.bridgePrivate), fromB64Url(pairing.wizzleKey));
   }
 
   private paired(session: Session): void {
-    const phone = session.peerKey;
-    if (!phone || !this.pairing) return;
-    const key = toB64Url(phone);
-    if (this.pairing.phoneKey !== key) {
+    const wizzle = session.peerKey;
+    if (!wizzle || !this.pairing) return;
+    const key = toB64Url(wizzle);
+    if (this.pairing.wizzleKey !== key) {
       this.opts.store.markPaired(key);
-      this.pairing = { ...this.pairing, phoneKey: key, pairedAt: new Date(this.now()).toISOString() };
-      this.opts.log.info('wizzle: phone paired');
+      this.pairing = { ...this.pairing, wizzleKey: key, pairedAt: new Date(this.now()).toISOString() };
+      this.opts.log.info('wizzle: paired');
     }
     this.clearExpiry();
     this.opts.store.clearInvite();
@@ -213,7 +213,7 @@ export class PairingManager {
 
   private fatal(code: string): void {
     if (code === 'revoked') {
-      this.opts.log.warn('wizzle: the phone removed this bridge, run ncl wizzle pair to pair again');
+      this.opts.log.warn('wizzle: the wizzle app removed this bridge, run ncl wizzle pair to pair again');
       this.close(false);
       this.opts.store.clear();
       return;
@@ -227,7 +227,7 @@ export class PairingManager {
     if (!pairing) return;
     this.expiry = setTimeout(() => {
       this.expiry = null;
-      if (this.pairing?.pairingId !== pairing.pairingId || this.pairing.phoneKey) return;
+      if (this.pairing?.pairingId !== pairing.pairingId || this.pairing.wizzleKey) return;
       this.opts.log.info('wizzle: the invite expired unused, run ncl wizzle pair for a new one');
       this.close(true);
       this.opts.store.clear();

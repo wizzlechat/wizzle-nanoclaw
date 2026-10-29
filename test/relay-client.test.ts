@@ -12,7 +12,7 @@ import {
   type SessionState,
 } from '../../wizzle-protocol/src/index.ts';
 import { RelayClient } from '../src/relay-client.ts';
-import { FakePhone, FakeRelay, bridgeKeys, collectingLog, newPairing, silentLog, until, type TestPairing } from './fake-relay.ts';
+import { FakeWizzle, FakeRelay, bridgeKeys, collectingLog, newPairing, silentLog, until, type TestPairing } from './fake-relay.ts';
 
 function note(text: string): Uint8Array {
   return encodePacket({ id: text, t: 'message', message: { conv: 'c', msgId: text, role: 'agent', text, format: 'text', at: 1 } });
@@ -50,22 +50,22 @@ test('hello, handshake, and a round trip through the relay', async () => {
   assert.equal(bridge.session.ready, false);
   assert.equal(bridge.client.send(note('too early')), false);
 
-  const phone = new FakePhone(relay, pairing);
-  await phone.connect();
+  const wizzle = new FakeWizzle(relay, pairing);
+  await wizzle.connect();
   await until(() => bridge.client.peerOnline);
-  await phone.handshake();
+  await wizzle.handshake();
   await until(() => bridge.session.ready && bridge.paired() === 1);
 
-  assert.equal(bridge.client.send(note('hello phone')), true);
-  await until(() => phone.received.length === 1);
-  assert.equal(phone.received[0]?.header.id, 'hello phone');
-  phone.received.length = 0;
+  assert.equal(bridge.client.send(note('hello wizzle')), true);
+  await until(() => wizzle.received.length === 1);
+  assert.equal(wizzle.received[0]?.header.id, 'hello wizzle');
+  wizzle.received.length = 0;
 
-  phone.send({ t: 'sync' });
+  wizzle.send({ t: 'sync' });
   await until(() => bridge.packets.length === 1);
   assert.match(bridge.packets[0] ?? '', /"t":"sync"/);
   bridge.client.stop();
-  phone.disconnect();
+  wizzle.disconnect();
 });
 
 test('persists the counter before a frame leaves', async () => {
@@ -74,9 +74,9 @@ test('persists the counter before a frame leaves', async () => {
   const bridge = bridgeClient(relay, pairing);
   bridge.client.start();
   await until(() => bridge.client.state === 'ready');
-  const phone = new FakePhone(relay, pairing);
-  await phone.connect();
-  await phone.handshake();
+  const wizzle = new FakeWizzle(relay, pairing);
+  await wizzle.connect();
+  await wizzle.handshake();
   await until(() => bridge.session.ready);
   const before = bridge.states.length;
   bridge.client.send(note('x'));
@@ -87,7 +87,7 @@ test('persists the counter before a frame leaves', async () => {
   assert.ok(sendEpoch);
   assert.equal(sendEpoch.sendSeq, '2');
   bridge.client.stop();
-  phone.disconnect();
+  wizzle.disconnect();
 });
 
 test('resends unacked frames after a reconnect and stops once acked', async () => {
@@ -97,32 +97,32 @@ test('resends unacked frames after a reconnect and stops once acked', async () =
   const bridge = bridgeClient(relay, pairing, { log });
   bridge.client.start();
   await until(() => bridge.client.state === 'ready');
-  const phone = new FakePhone(relay, pairing);
-  phone.autoAck = false;
-  await phone.connect();
-  await phone.handshake();
+  const wizzle = new FakeWizzle(relay, pairing);
+  wizzle.autoAck = false;
+  await wizzle.connect();
+  await wizzle.handshake();
   await until(() => bridge.session.ready);
 
   relay.drop('bridge');
   await until(() => bridge.client.state === 'connecting');
   assert.equal(bridge.client.send(note('while offline')), true);
   await until(() => bridge.client.state === 'ready');
-  await until(() => phone.received.length === 1);
-  const framesAfterFirst = phone.dataFrames;
+  await until(() => wizzle.received.length === 1);
+  const framesAfterFirst = wizzle.dataFrames;
 
-  // No ack yet, so a second reconnect resends the same frame and the phone rejects the duplicate.
+  // No ack yet, so a second reconnect resends the same frame and wizzle rejects the duplicate.
   relay.drop('bridge');
   await until(() => bridge.client.state === 'connecting');
   await until(() => bridge.client.state === 'ready');
-  await until(() => phone.dataFrames === framesAfterFirst + 1);
-  assert.equal(phone.received.length, 1);
+  await until(() => wizzle.dataFrames === framesAfterFirst + 1);
+  assert.equal(wizzle.received.length, 1);
 
-  const ack = phone.session.ack();
+  const ack = wizzle.session.ack();
   assert.ok(ack);
-  phone.autoAck = true;
-  phone.send({ t: 'sync' });
+  wizzle.autoAck = true;
+  wizzle.send({ t: 'sync' });
   await until(() => bridge.packets.length === 1);
-  const conn = (phone as unknown as { conn: { sendBinary(b: Uint8Array): void } }).conn;
+  const conn = (wizzle as unknown as { conn: { sendBinary(b: Uint8Array): void } }).conn;
   conn.sendBinary(ack);
   await new Promise((resolve) => setTimeout(resolve, 10));
 
@@ -130,53 +130,53 @@ test('resends unacked frames after a reconnect and stops once acked', async () =
   await until(() => bridge.client.state === 'connecting');
   await until(() => bridge.client.state === 'ready');
   await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(phone.dataFrames, framesAfterFirst + 1);
+  assert.equal(wizzle.dataFrames, framesAfterFirst + 1);
   assert.ok(log.lines.some((l) => l.startsWith('warn wizzle: relay connection closed')));
   bridge.client.stop();
-  phone.disconnect();
+  wizzle.disconnect();
 });
 
-test('frames buffered by the relay while the phone is offline arrive on reconnect', async () => {
+test('frames buffered by the relay while wizzle is offline arrive on reconnect', async () => {
   const relay = new FakeRelay();
   const pairing = newPairing();
   const bridge = bridgeClient(relay, pairing);
   bridge.client.start();
   await until(() => bridge.client.state === 'ready');
-  const phone = new FakePhone(relay, pairing);
-  await phone.connect();
-  await phone.handshake();
+  const wizzle = new FakeWizzle(relay, pairing);
+  await wizzle.connect();
+  await wizzle.handshake();
   await until(() => bridge.session.ready);
-  phone.disconnect();
+  wizzle.disconnect();
   await until(() => !bridge.client.peerOnline);
   bridge.client.send(note('a'));
   bridge.client.send(note('b'));
-  await until(() => relay.bufferedFor('phone') === 2);
+  await until(() => relay.bufferedFor('wizzle') === 2);
 
-  const state = phone.session.exportState();
-  const again = new FakePhone(relay, pairing, state);
+  const state = wizzle.session.exportState();
+  const again = new FakeWizzle(relay, pairing, state);
   await again.connect();
   await until(() => again.received.length === 2);
-  assert.equal(relay.bufferedFor('phone'), 0);
+  assert.equal(relay.bufferedFor('wizzle'), 0);
   bridge.client.stop();
   again.disconnect();
 });
 
-test('wake goes to the relay only while the phone is offline, and waits for the next welcome when not attached', async () => {
+test('wake goes to the relay only while wizzle is offline, and waits for the next welcome when not attached', async () => {
   const relay = new FakeRelay();
   const pairing = newPairing();
   const bridge = bridgeClient(relay, pairing);
   bridge.client.start();
   await until(() => bridge.client.state === 'ready');
-  const phone = new FakePhone(relay, pairing);
-  await phone.connect();
-  await phone.handshake();
+  const wizzle = new FakeWizzle(relay, pairing);
+  await wizzle.connect();
+  await wizzle.handshake();
   await until(() => bridge.session.ready && bridge.client.peerOnline);
 
   bridge.client.requestPush();
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(relay.wakes, 0);
 
-  phone.disconnect();
+  wizzle.disconnect();
   await until(() => !bridge.client.peerOnline);
   bridge.client.requestPush();
   await until(() => relay.wakes === 1);
@@ -196,23 +196,23 @@ test('wake goes to the relay only while the phone is offline, and waits for the 
   bridge.client.stop();
 });
 
-test('a pending wake is dropped when the phone is back by the next welcome', async () => {
+test('a pending wake is dropped when wizzle is back by the next welcome', async () => {
   const relay = new FakeRelay();
   const pairing = newPairing();
   const bridge = bridgeClient(relay, pairing, { reconnect: { minMs: 40, maxMs: 40 } });
   bridge.client.start();
   await until(() => bridge.client.state === 'ready');
-  const phone = new FakePhone(relay, pairing);
-  await phone.connect();
-  await phone.handshake();
+  const wizzle = new FakeWizzle(relay, pairing);
+  await wizzle.connect();
+  await wizzle.handshake();
   await until(() => bridge.session.ready);
-  phone.disconnect();
+  wizzle.disconnect();
   await until(() => !bridge.client.peerOnline);
 
   relay.drop('bridge');
   await until(() => bridge.client.state === 'connecting');
   bridge.client.requestPush();
-  const again = new FakePhone(relay, pairing, phone.session.exportState());
+  const again = new FakeWizzle(relay, pairing, wizzle.session.exportState());
   await again.connect();
   await until(() => bridge.client.state === 'ready' && bridge.client.peerOnline);
   await new Promise((resolve) => setTimeout(resolve, 10));
@@ -221,23 +221,23 @@ test('a pending wake is dropped when the phone is back by the next welcome', asy
   again.disconnect();
 });
 
-test('the outbox is resent when the phone comes back and the phone drops the repeat', async () => {
+test('the outbox is resent when wizzle comes back and wizzle drops the repeat', async () => {
   const relay = new FakeRelay();
   const pairing = newPairing();
   const bridge = bridgeClient(relay, pairing);
   bridge.client.start();
   await until(() => bridge.client.state === 'ready');
-  const phone = new FakePhone(relay, pairing);
-  phone.autoAck = false;
-  await phone.connect();
-  await phone.handshake();
+  const wizzle = new FakeWizzle(relay, pairing);
+  wizzle.autoAck = false;
+  await wizzle.connect();
+  await wizzle.handshake();
   await until(() => bridge.session.ready);
   bridge.client.send(note('unacked'));
-  await until(() => phone.received.length === 1);
-  phone.disconnect();
+  await until(() => wizzle.received.length === 1);
+  wizzle.disconnect();
   await until(() => !bridge.client.peerOnline);
 
-  const again = new FakePhone(relay, pairing, phone.session.exportState());
+  const again = new FakeWizzle(relay, pairing, wizzle.session.exportState());
   await again.connect();
   await until(() => bridge.client.peerOnline);
   await until(() => again.dataFrames === 1);
@@ -248,21 +248,21 @@ test('the outbox is resent when the phone comes back and the phone drops the rep
   again.disconnect();
 });
 
-test('a replayed phone frame is dropped silently: no log, no new handshake', async () => {
+test('a replayed wizzle frame is dropped silently: no log, no new handshake', async () => {
   const relay = new FakeRelay();
   const pairing = newPairing();
   const log = collectingLog();
   const bridge = bridgeClient(relay, pairing, { log });
   bridge.client.start();
   await until(() => bridge.client.state === 'ready');
-  const phone = new FakePhone(relay, pairing);
-  await phone.connect();
-  await phone.handshake();
+  const wizzle = new FakeWizzle(relay, pairing);
+  await wizzle.connect();
+  await wizzle.handshake();
   await until(() => bridge.session.ready && bridge.paired() === 1);
   const before = log.lines.length;
 
-  const frame = phone.session.seal(encodePacket({ id: 'once', t: 'sync' }));
-  const conn = (phone as unknown as { conn: { sendBinary(b: Uint8Array): void } }).conn;
+  const frame = wizzle.session.seal(encodePacket({ id: 'once', t: 'sync' }));
+  const conn = (wizzle as unknown as { conn: { sendBinary(b: Uint8Array): void } }).conn;
   conn.sendBinary(frame);
   await until(() => bridge.packets.length === 1);
   conn.sendBinary(frame);
@@ -271,7 +271,7 @@ test('a replayed phone frame is dropped silently: no log, no new handshake', asy
   assert.equal(bridge.paired(), 1);
   assert.equal(log.lines.length, before);
   bridge.client.stop();
-  phone.disconnect();
+  wizzle.disconnect();
 });
 
 test('an auth error from the relay stops the client for good', async () => {
@@ -290,11 +290,11 @@ test('an auth error from the relay stops the client for good', async () => {
 function secrets(pairing: TestPairing) {
   return {
     invite: deriveRelaySecret(nodeCrypto, pairing.secret),
-    paired: derivePairedRelaySecret(nodeCrypto, pairing.pairingId, pairing.bridge.privateKey, pairing.phone.publicKey),
+    paired: derivePairedRelaySecret(nodeCrypto, pairing.pairingId, pairing.bridge.privateKey, pairing.wizzle.publicKey),
   };
 }
 
-test('pinning a phone rotates the relay secret and later connects use the paired one', async () => {
+test('pinning wizzle rotates the relay secret and later connects use the paired one', async () => {
   const relay = new FakeRelay();
   const pairing = newPairing();
   const { invite, paired } = secrets(pairing);
@@ -303,9 +303,9 @@ test('pinning a phone rotates the relay secret and later connects use the paired
   const bridge = bridgeClient(relay, pairing, { pairedSecret: () => (pinned ? paired : null), onPaired: () => void (pinned = true) });
   bridge.client.start();
   await until(() => bridge.client.state === 'ready');
-  const phone = new FakePhone(relay, pairing);
-  await phone.connect();
-  await phone.handshake();
+  const wizzle = new FakeWizzle(relay, pairing);
+  await wizzle.connect();
+  await wizzle.handshake();
   await until(() => relay.rekeys.length === 1);
   assert.equal(relay.rekeys[0], toB64Url(paired));
   assert.equal(relay.expectedSecret, toB64Url(paired));
@@ -315,7 +315,7 @@ test('pinning a phone rotates the relay secret and later connects use the paired
   assert.equal(relay.rekeys.length, 1);
   assert.deepEqual(bridge.fatal, []);
   bridge.client.stop();
-  phone.disconnect();
+  wizzle.disconnect();
 });
 
 test('a relay that missed the rekey gets the invite secret once and the rekey again', async () => {
@@ -332,17 +332,17 @@ test('a relay that missed the rekey gets the invite secret once and the rekey ag
   bridge.client.stop();
 });
 
-test('revoke tells the relay, which cuts off the phone, and stops the client', async () => {
+test('revoke tells the relay, which cuts off wizzle, and stops the client', async () => {
   const relay = new FakeRelay();
   const pairing = newPairing();
   const bridge = bridgeClient(relay, pairing);
   bridge.client.start();
   await until(() => bridge.client.state === 'ready');
-  const phone = new FakePhone(relay, pairing);
-  await phone.connect();
+  const wizzle = new FakeWizzle(relay, pairing);
+  await wizzle.connect();
   await until(() => bridge.client.peerOnline);
   bridge.client.revoke();
-  await until(() => phone.control.some((m) => m.t === 'error' && m.code === 'revoked'));
+  await until(() => wizzle.control.some((m) => m.t === 'error' && m.code === 'revoked'));
   assert.equal(relay.revoked, 1);
   assert.equal(bridge.client.state, 'stopped');
 });

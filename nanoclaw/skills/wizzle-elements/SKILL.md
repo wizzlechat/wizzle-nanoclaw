@@ -1,17 +1,17 @@
 ---
 name: wizzle-elements
-description: Make UI elements in the wizzle phone app, only for what a chat message cannot do, such as flash cards to flip, a deck to swipe through, or a report the user comes back to while you keep it up to date. Everything else goes in a normal markdown message.
+description: Make UI elements in the wizzle app, only for what a chat message cannot do, such as flash cards to flip, a deck to swipe through, or a report the user comes back to while you keep it up to date. Everything else goes in a normal markdown message.
 ---
 
 # wizzle elements
 
-An element is a JSON file you write and send with `send_file`. The wizzle phone app draws it with its own design, shows a link to it in the chat, and lists it under Elements. Elements only appear in the wizzle app; anywhere else the file is just a file.
+An element is a JSON file you write and send with `send_file`. The wizzle app draws it with its own design, shows a link to it in the chat, and lists it under Elements. Elements only appear in the wizzle app; anywhere else the file is just a file.
 
 ## When to make one
 
 Answer in a normal message by default. The chat renders markdown: headings, bold, lists, links, code and images. Make an element only when a message cannot do the job:
 
-- the user interacts with it on the phone, such as cards to flip or a deck to swipe through;
+- the user interacts with it in wizzle, such as cards to flip or a deck to swipe through;
 - it needs a layout markdown cannot show;
 - the user comes back to it and you keep it up to date, such as a deck they study again or a report you refresh during the day.
 
@@ -21,7 +21,7 @@ Never make one just to format text, a list or a link.
 
 1. Write the JSON to `elements/<id>.wizzle.json` in your workspace. The file name must end in `.wizzle.json`.
 2. Send it with `send_file` to the conversation you are answering, with a short `text` such as "Here is your deck".
-3. To change an element, edit the same file, keep its `id`, and send it again. The phone replaces its copy, and every link to it opens the new version. Keep the file: it is your only copy.
+3. To change an element, edit the same file, keep its `id`, and send it again. The wizzle app replaces its copy, and every link to it opens the new version. Keep the file: it is your only copy.
 
 ## Format
 

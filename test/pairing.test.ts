@@ -10,7 +10,7 @@ import { WizzleBridge, type BridgeHost } from '../src/bridge.ts';
 import { DEFAULT_RELAY_URL, PairingManager, inviteText, isRelayUrl, type PairingManagerOptions } from '../src/pairing.ts';
 import { encodeQr } from '../src/qr.ts';
 import { BridgeStore } from '../src/store.ts';
-import { FakePhone, FakeRelay, silentLog, until, type TestPairing } from './fake-relay.ts';
+import { FakeWizzle, FakeRelay, silentLog, until, type TestPairing } from './fake-relay.ts';
 
 const host = {
   runtime: 'test',
@@ -51,18 +51,18 @@ function setup(extra: Partial<PairingManagerOptions> = {}, store = new BridgeSto
   return { relay, bridge, store, manager, announced };
 }
 
-// What the phone learns from the QR code, plus a static key of its own.
+// What wizzle learns from the QR code, plus a static key of its own.
 function scan(url: string): TestPairing {
   const invite = parseInvite(url);
   return {
     pairingId: invite.pairingId,
     secret: invite.secret,
     bridge: { publicKey: invite.bridgeKey, privateKey: new Uint8Array(32) },
-    phone: nodeCrypto.x25519KeyPair(),
+    wizzle: nodeCrypto.x25519KeyPair(),
   };
 }
 
-test('an issued invite pairs one phone, pins it, and rotates the relay secret', async () => {
+test('an issued invite pairs one wizzle, pins it, and rotates the relay secret', async () => {
   const t = setup();
   const issued = t.manager.issue(false);
   assert.equal(t.manager.state, 'inviting');
@@ -75,32 +75,32 @@ test('an issued invite pairs one phone, pins it, and rotates the relay secret', 
   await until(() => t.bridge.connected);
 
   const pairing = scan(issued.url);
-  const phone = new FakePhone(t.relay, pairing);
-  await phone.connect();
-  await phone.handshake();
+  const wizzle = new FakeWizzle(t.relay, pairing);
+  await wizzle.connect();
+  await wizzle.handshake();
   await until(() => t.manager.state === 'paired' && t.relay.rekeys.length === 1);
-  assert.equal(t.store.loadPairing()?.phoneKey, toB64Url(pairing.phone.publicKey));
+  assert.equal(t.store.loadPairing()?.wizzleKey, toB64Url(pairing.wizzle.publicKey));
   const bridgePrivate = fromB64Url(t.store.loadPairing()?.bridgePrivate ?? '');
-  const paired = derivePairedRelaySecret(nodeCrypto, pairing.pairingId, bridgePrivate, pairing.phone.publicKey);
+  const paired = derivePairedRelaySecret(nodeCrypto, pairing.pairingId, bridgePrivate, pairing.wizzle.publicKey);
   assert.equal(t.relay.expectedSecret, toB64Url(paired));
-  phone.disconnect();
+  wizzle.disconnect();
 });
 
-test('a paired phone is only replaced on request, which revokes it at the relay', async () => {
+test('a paired wizzle is only replaced on request, which revokes it at the relay', async () => {
   const t = setup();
   const first = t.manager.issue(false);
   await until(() => t.bridge.connected);
-  const phone = new FakePhone(t.relay, scan(first.url));
-  await phone.connect();
-  await phone.handshake();
+  const wizzle = new FakeWizzle(t.relay, scan(first.url));
+  await wizzle.connect();
+  await wizzle.handshake();
   await until(() => t.manager.state === 'paired');
   assert.throws(() => t.manager.issue(false), (err: Error & { code?: string }) => err.code === 'paired');
   const second = t.manager.issue(true);
-  await until(() => phone.control.some((m) => m.t === 'error' && m.code === 'revoked'));
+  await until(() => wizzle.control.some((m) => m.t === 'error' && m.code === 'revoked'));
   assert.equal(t.relay.revoked, 1);
   assert.equal(t.manager.state, 'inviting');
   assert.notEqual(parseInvite(second.url).pairingId.join(), parseInvite(first.url).pairingId.join());
-  assert.equal(t.store.loadPairing()?.phoneKey, undefined);
+  assert.equal(t.store.loadPairing()?.wizzleKey, undefined);
 });
 
 test('an invite nobody scans expires, is revoked, and leaves nothing on disk', async () => {
@@ -118,11 +118,11 @@ test('start resumes a paired install quietly and a pending invite loudly, and dr
   const first = setup();
   const issued = first.manager.issue(false);
   await until(() => first.bridge.connected);
-  const phone = new FakePhone(first.relay, scan(issued.url));
-  await phone.connect();
-  await phone.handshake();
+  const wizzle = new FakeWizzle(first.relay, scan(issued.url));
+  await wizzle.connect();
+  await wizzle.handshake();
   await until(() => first.manager.state === 'paired');
-  phone.disconnect();
+  wizzle.disconnect();
   first.manager.stop();
 
   const resumed = setup({}, first.store);
@@ -130,7 +130,7 @@ test('start resumes a paired install quietly and a pending invite loudly, and dr
   assert.equal(resumed.manager.state, 'paired');
   assert.deepEqual(resumed.announced, []);
   await until(() => resumed.bridge.connected);
-  assert.equal(resumed.relay.hellos[0], toB64Url(derivePairedRelaySecret(nodeCrypto, scan(issued.url).pairingId, fromB64Url(first.store.loadPairing()?.bridgePrivate ?? ''), fromB64Url(first.store.loadPairing()?.phoneKey ?? ''))));
+  assert.equal(resumed.relay.hellos[0], toB64Url(derivePairedRelaySecret(nodeCrypto, scan(issued.url).pairingId, fromB64Url(first.store.loadPairing()?.bridgePrivate ?? ''), fromB64Url(first.store.loadPairing()?.wizzleKey ?? ''))));
   resumed.manager.stop();
 
   const pending = setup();
@@ -148,15 +148,15 @@ test('start resumes a paired install quietly and a pending invite loudly, and dr
   assert.equal(pending.store.loadPairing(), null);
 });
 
-test('a phone that removes the bridge resets it to unpaired', async () => {
+test('wizzle that removes the bridge resets it to unpaired', async () => {
   const t = setup();
   const issued = t.manager.issue(false);
   await until(() => t.bridge.connected);
-  const phone = new FakePhone(t.relay, scan(issued.url));
-  await phone.connect();
-  await phone.handshake();
+  const wizzle = new FakeWizzle(t.relay, scan(issued.url));
+  await wizzle.connect();
+  await wizzle.handshake();
   await until(() => t.manager.state === 'paired');
-  phone.revoke();
+  wizzle.revoke();
   await until(() => t.manager.state === 'none');
   assert.equal(t.store.loadPairing(), null);
 });

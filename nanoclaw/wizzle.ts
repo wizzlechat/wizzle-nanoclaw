@@ -1,4 +1,4 @@
-// wizzle channel: a phone paired to this NanoClaw install through the wizzle relay.
+// wizzle channel: the wizzle app paired to this NanoClaw install through the wizzle relay.
 // Lives at src/channels/wizzle.ts in the fork; the core sits in src/channels/wizzle/.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -84,8 +84,8 @@ import {
 export const CHANNEL_TYPE = 'wizzle';
 export const OWNER_USER_ID = 'wizzle:owner';
 const PLATFORM_PREFIX = 'wizzle:agent:';
-const CONVERSATION_NAME = 'Phone';
-const SENDER_NAME = 'Phone';
+const CONVERSATION_NAME = 'Wizzle';
+const SENDER_NAME = 'Wizzle';
 const TOPIC_SLUG_MAX = 40;
 const MAX_CONV_CHARS = 200;
 const CONTAINER_STOP_MS = 10_000;
@@ -138,7 +138,7 @@ export function slugForTitle(title: string): string {
     .replace(/-+$/, '');
 }
 
-// Host errors carrying a code reach the phone as that error code.
+// Host errors carrying a code reach wizzle as that error code.
 function coded(code: string, message: string): Error {
   return Object.assign(new Error(message), { code });
 }
@@ -181,7 +181,7 @@ function isWizzleGroup(group: MessagingGroup): boolean {
   return group.channel_type === CHANNEL_TYPE && (group.instance ?? group.channel_type) === CHANNEL_TYPE;
 }
 
-// A topic is never the default, so the setup wiring `wizzle:phone` still counts as one.
+// A topic is never the default, so the setup wiring `wizzle:wizzle` still counts as one.
 function isDefaultWizzleGroup(group: MessagingGroup): boolean {
   return isWizzleGroup(group) && !isTopicConv(group.platform_id);
 }
@@ -212,7 +212,7 @@ export async function ensureWizzleConversations(): Promise<void> {
     try {
       await ensureConversation(agent);
     } catch (err) {
-      log.warn('wizzle: could not wire agent to the phone conversation', { agent: agent.id, err });
+      log.warn('wizzle: could not wire agent to the wizzle conversation', { agent: agent.id, err });
     }
   }
 }
@@ -604,7 +604,7 @@ function toInjection(raw: unknown): SecretInjection | undefined {
   return undefined;
 }
 
-// Only what the phone shows; OneCLI never lists a value.
+// Only what wizzle shows; OneCLI never lists a value.
 function toSecret(row: unknown): Secret | undefined {
   if (!isRecord(row) || typeof row.id !== 'string' || typeof row.name !== 'string' || typeof row.hostPattern !== 'string') return undefined;
   const type = SECRET_TYPES.find((one) => one === row.type);
@@ -743,7 +743,7 @@ async function attachKeys(group: AgentGroup, secretIds: string[]): Promise<strin
 
 function onboardingText(name: string, purpose: string, pausedTasks: string[]): string {
   const lines = [
-    `You are ${name}. You were created from the owner's phone a moment ago and this is your first turn.`,
+    `You are ${name}. You were created from the owner's wizzle app a moment ago and this is your first turn.`,
     'The owner wrote this purpose for you:',
     '',
     purpose,
@@ -868,7 +868,7 @@ export function createHost(notify: Notify): BridgeHost {
         try {
           conv = await ensureConversation(group);
         } catch (err) {
-          log.warn('wizzle: agent has no phone conversation, hidden from the phone', { agent: group.id, err });
+          log.warn('wizzle: agent has no wizzle conversation, hidden from the wizzle app', { agent: group.id, err });
           continue;
         }
         const session = await sessionFor(group.id, conv);
@@ -934,7 +934,7 @@ export function createHost(notify: Notify): BridgeHost {
         try {
           defaultConv = await ensureConversation(agent);
         } catch (err) {
-          log.warn('wizzle: agent has no phone conversation, hidden from the phone', { agent: agent.id, err });
+          log.warn('wizzle: agent has no wizzle conversation, hidden from the wizzle app', { agent: agent.id, err });
           continue;
         }
         const groups = await wizzleGroupsFor(agent.id);
@@ -1138,7 +1138,7 @@ let pairings: PairingManager | null = null;
 // Runs in the service over the host-only ncl socket, so the QR prints in the operator's terminal.
 register<{ replace: boolean }, IssuedInvite>({
   name: 'wizzle-pair',
-  description: 'Show a one-time QR code that pairs the wizzle phone app with this install. --replace unpairs the current phone first.',
+  description: 'Show a one-time QR code that pairs the wizzle app with this install. --replace unpairs the current wizzle app first.',
   access: 'hidden',
   hostOnly: true,
   parseArgs: (raw) => ({ replace: raw.replace === true || raw.replace === 'true' }),
@@ -1222,7 +1222,7 @@ function createAdapter(): ChannelAdapter | null {
       return bridge.connected;
     },
 
-    // Host-initiated DMs (approval cards) land in the phone's System conversation.
+    // Host-initiated DMs (approval cards) land in wizzle's System conversation.
     async openDM(): Promise<string> {
       return SYSTEM_CONV;
     },

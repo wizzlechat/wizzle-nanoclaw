@@ -20,7 +20,7 @@ export type Logger = {
   error(msg: string, data?: Record<string, unknown>): void;
 };
 
-// relaySecret comes from the invite; pairedSecret, once a phone is pinned, replaces it at the relay.
+// relaySecret comes from the invite; pairedSecret, once wizzle is pinned, replaces it at the relay.
 export type RelayClientOptions = {
   transport: Transport;
   relayUrl: string;
@@ -73,7 +73,7 @@ export class RelayClient {
     this.connect();
   }
 
-  // Tells the relay to forget the pairing, which also cuts off the phone, then stops.
+  // Tells the relay to forget the pairing, which also cuts off wizzle, then stops.
   revoke(): void {
     if (this.state === 'ready') this.conn?.sendText(encodeControl({ t: 'revoke' }));
     this.stop();
@@ -109,7 +109,7 @@ export class RelayClient {
     return true;
   }
 
-  // Asks the relay to push the phone while it is offline. Not attached: held until the next welcome.
+  // Asks the relay to push wizzle while it is offline. Not attached: held until the next welcome.
   requestPush(): void {
     if (this.state !== 'ready') {
       this.pushPending = true;
@@ -265,7 +265,7 @@ export class RelayClient {
         this.opts.persist(session.exportState());
         if (result.reply) this.conn?.sendBinary(result.reply);
         this.sendAck();
-        this.opts.log.info('wizzle: phone session established');
+        this.opts.log.info('wizzle: session established');
         this.opts.onPaired?.();
         this.rekey();
         return;
@@ -283,7 +283,7 @@ export class RelayClient {
     }
   }
 
-  // Retires the invite secret at the relay once a phone is pinned, so a leaked invite cannot attach anymore.
+  // Retires the invite secret at the relay once wizzle is pinned, so a leaked invite cannot attach anymore.
   private rekey(): void {
     const target = this.opts.pairedSecret?.() ?? null;
     if (!target || this.state !== 'ready' || !this.attachedWith || equal(target, this.attachedWith)) return;
@@ -292,7 +292,7 @@ export class RelayClient {
     this.opts.log.info('wizzle: relay secret rotated to the paired one');
   }
 
-  // Unacked frames go again after a welcome and when the phone comes back; the receiver drops repeats.
+  // Unacked frames go again after a welcome and when wizzle comes back; the receiver drops repeats.
   private resendOutbox(): void {
     for (const pending of this.outbox) this.conn?.sendBinary(pending.bytes);
   }
