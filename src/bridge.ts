@@ -609,6 +609,9 @@ export class WizzleBridge {
         }
         hooks.onAction(questionId, typeof value === 'string' ? value : value.map(String).join(','));
         this.markAwaitingForQuestion(questionId);
+        // The answer spends the question, and the runtime never edits an agent's question card, so it closes here.
+        this.questionConv.delete(questionId);
+        this.broadcast({ t: 'question_resolved', questionId, value: typeof value === 'string' ? value : value.map(String), id: randomUUID() });
         return;
       }
       case 'resolve': {

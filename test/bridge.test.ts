@@ -204,7 +204,7 @@ test('uploads attach to the next send as base64', async () => {
   t.bridge.stop();
 });
 
-test('answers and approvals route to onAction', async () => {
+test('answers and approvals route to onAction, and an answer closes its question', async () => {
   const t = await paired();
   t.wizzle.send({ t: 'answer', questionId: 'q1', value: 'a' });
   t.wizzle.send({ t: 'resolve', approvalId: 'ap1', decision: 'allow' });
@@ -213,6 +213,9 @@ test('answers and approvals route to onAction', async () => {
     { questionId: 'q1', value: 'a' },
     { questionId: 'ap1', value: 'allow' },
   ]);
+  const resolved = await t.wizzle.nextOf('question_resolved');
+  assert.equal(resolved.header.questionId, 'q1');
+  assert.equal(resolved.header.value, 'a');
   t.bridge.stop();
 });
 
