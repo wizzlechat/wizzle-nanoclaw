@@ -13,7 +13,8 @@ Answer in a normal message by default. The chat renders markdown: headings, bold
 
 - the user interacts with it in wizzle, such as cards to flip or a deck to swipe through;
 - it needs a layout markdown cannot show;
-- the user comes back to it and you keep it up to date, such as a deck they study again or a report you refresh during the day.
+- the user comes back to it and you keep it up to date, such as a deck they study again or a report you refresh during the day;
+- it is a long document you draft and revise, such as a blog post or a report: an `article`.
 
 Never make one just to format text, a list or a link.
 
@@ -37,14 +38,22 @@ Never make one just to format text, a list or a link.
 
 Nodes:
 
-- `{ "type": "text", "text": "...", "role": "title" }`: plain text, no markdown. `role` is `title`, `body` (the default) or `caption`.
+- `{ "type": "text", "text": "...", "role": "title" }`: plain text, no markdown. `role` is `title`, `heading`, `body` (the default) or `caption`. `heading` starts a section; `caption` is a small note under something, never a section title.
 - `{ "type": "image", "url": "https://...", "alt": "..." }`: an https image; `alt` says what it shows.
 - `{ "type": "stack", "children": [ ... ] }`: nodes one under another.
 - `{ "type": "list", "items": [ ... ], "ordered": true }`: a bulleted list, numbered when `ordered` is true.
 - `{ "type": "reveal", "front": <node>, "back": <node> }`: shows the front; a tap flips it to the back and back again.
 - `{ "type": "pager", "pages": [ ... ] }`: one page at a time, swiped through, with a page count.
+- `{ "type": "article", "title": "...", "subtitle": "...", "byline": "...", "cover": <image>, "body": "..." }`: a long read. `body` is markdown (headings, bold, links, lists, quotes, code, images), the only place markdown works in an element, up to 40000 characters. `title`, `subtitle`, `byline` and `cover` are optional; `cover` is an `image` node drawn across the top. Give the article the same `title` as the element.
 
-There are no colors, fonts, sizes or positions: the app decides how everything looks. Limits: 8 levels deep, 50 children or items per node, 200 pages, 2000 nodes, 4000 characters per text. The app drops anything invalid and shows the rest; an element without a valid `id`, `title` or `content` shows only as a file.
+There are no colors, fonts, sizes or positions: the app decides how everything looks. Limits: 8 levels deep, 50 children or items per node, 200 pages, 2000 nodes, 4000 characters per text, 40000 per article body. The app drops anything invalid and shows the rest; an element without a valid `id`, `title` or `content` shows only as a file.
+
+## Which node
+
+- Cards to flip: `reveal` nodes inside a `pager`.
+- Slides, steps or anything read one screen at a time: `pager`.
+- A short structured report or summary: a `stack` of `text` and `list` nodes.
+- A blog post, essay, report or any long text: one `article`. Never split it into pages or fake headings with `text` roles.
 
 ## Examples
 
@@ -79,13 +88,30 @@ A daily report you refresh during the day by sending the same `id` again:
   "kind": "Daily report",
   "title": "Thursday, October 22",
   "content": { "type": "stack", "children": [
-    { "type": "text", "role": "caption", "text": "Weather" },
+    { "type": "text", "role": "heading", "text": "Weather" },
     { "type": "text", "text": "Sunny, high of 18, light wind." },
-    { "type": "text", "role": "caption", "text": "Today" },
+    { "type": "text", "role": "heading", "text": "Today" },
     { "type": "list", "items": [
       { "type": "text", "text": "Dentist at 10:30" },
       { "type": "text", "text": "Call the bank" }
     ] }
   ] }
+}
+```
+
+A blog post draft. Each revision keeps the `id`, so sending it again replaces the last draft:
+
+```json
+{
+  "wizzle": 1,
+  "id": "post-relay-rust",
+  "kind": "Blog draft",
+  "title": "Why the relay is Rust",
+  "content": { "type": "article",
+    "title": "Why the relay is Rust",
+    "subtitle": "A blind relay has one job, so the language had to get out of the way.",
+    "byline": "Draft 2, October 31",
+    "cover": { "type": "image", "url": "https://example.com/relay.png", "alt": "A rack of servers" },
+    "body": "## The problem\n\nThe relay forwards **ciphertext** and reads a 17 byte header.\n\n## What changed\n\n- No sessions\n- No parsing" }
 }
 ```
