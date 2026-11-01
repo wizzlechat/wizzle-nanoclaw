@@ -58,6 +58,8 @@ export type PairingManagerOptions = {
   relay: string;
   name?: string;
   runtime?: string;
+  // The host command that shows a new code, named in log lines and refusals.
+  pairCommand?: string;
   ttlMs?: number;
   now?(): number;
   announce?(url: string, expiresAt: number): void;
@@ -89,11 +91,11 @@ export class PairingManager {
     if (!stored) return;
     if (!stored.wizzleKey && stored.expiresAt * 1000 <= this.now()) {
       this.opts.store.clear();
-      this.opts.log.info('wizzle: the pending invite expired, run ncl wizzle pair for a new one');
+      this.opts.log.info(`wizzle: the pending invite expired, run ${this.pairCommand} for a new one`);
       return;
     }
     if (stored.relay !== this.opts.relay) {
-      this.opts.log.warn('wizzle: the relay URL changed since pairing, wizzle still dials the old one; run ncl wizzle pair --replace', {
+      this.opts.log.warn(`wizzle: the relay URL changed since pairing, wizzle still dials the old one; run ${this.pairCommand} --replace`, {
         paired: stored.relay,
         configured: this.opts.relay,
       });
@@ -105,7 +107,7 @@ export class PairingManager {
   // A new invite replaces a pending one; replacing a paired wizzle app cuts it off, so that needs replace.
   issue(replace: boolean): IssuedInvite {
     if (this.pairing?.wizzleKey && !replace) {
-      throw coded('paired', 'A wizzle app is already paired. Run ncl wizzle pair --replace to unpair it and show a new code.');
+      throw coded('paired', `A wizzle app is already paired. Run ${this.pairCommand} --replace to unpair it and show a new code.`);
     }
     this.close(true);
     const { crypto } = this.opts;
@@ -140,6 +142,18 @@ export class PairingManager {
   // Shutdown only: the relay keeps the pairing so the next start resumes it.
   stop(): void {
     this.close(false);
+  }
+
+  // The relay forgets the pairing and the store is emptied; false when there was none.
+  unpair(): boolean {
+    const had = this.pairing !== null || this.opts.store.loadPairing() !== null;
+    this.close(true);
+    this.opts.store.clear();
+    return had;
+  }
+
+  private get pairCommand(): string {
+    return this.opts.pairCommand ?? 'ncl wizzle pair';
   }
 
   private now(): number {
@@ -213,12 +227,12 @@ export class PairingManager {
 
   private fatal(code: string): void {
     if (code === 'revoked') {
-      this.opts.log.warn('wizzle: the wizzle app removed this bridge, run ncl wizzle pair to pair again');
+      this.opts.log.warn(`wizzle: the wizzle app removed this bridge, run ${this.pairCommand} to pair again`);
       this.close(false);
       this.opts.store.clear();
       return;
     }
-    this.opts.log.error('wizzle: the relay refused this pairing, run ncl wizzle pair --replace', { code });
+    this.opts.log.error(`wizzle: the relay refused this pairing, run ${this.pairCommand} --replace`, { code });
   }
 
   private armExpiry(): void {
@@ -228,7 +242,7 @@ export class PairingManager {
     this.expiry = setTimeout(() => {
       this.expiry = null;
       if (this.pairing?.pairingId !== pairing.pairingId || this.pairing.wizzleKey) return;
-      this.opts.log.info('wizzle: the invite expired unused, run ncl wizzle pair for a new one');
+      this.opts.log.info(`wizzle: the invite expired unused, run ${this.pairCommand} for a new one`);
       this.close(true);
       this.opts.store.clear();
     }, Math.max(0, pairing.expiresAt * 1000 - this.now()));

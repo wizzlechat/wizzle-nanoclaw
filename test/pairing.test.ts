@@ -103,6 +103,22 @@ test('a paired wizzle is only replaced on request, which revokes it at the relay
   assert.equal(t.store.loadPairing()?.wizzleKey, undefined);
 });
 
+test('unpair revokes a paired wizzle at the relay and empties the store', async () => {
+  const t = setup({ pairCommand: 'openclaw wizzle pair' });
+  const issued = t.manager.issue(false);
+  await until(() => t.bridge.connected);
+  const wizzle = new FakeWizzle(t.relay, scan(issued.url));
+  await wizzle.connect();
+  await wizzle.handshake();
+  await until(() => t.manager.state === 'paired');
+  assert.throws(() => t.manager.issue(false), /Run openclaw wizzle pair --replace/);
+  assert.equal(t.manager.unpair(), true);
+  await until(() => t.relay.revoked === 1);
+  assert.equal(t.manager.state, 'none');
+  assert.equal(t.store.loadPairing(), null);
+  assert.equal(t.manager.unpair(), false);
+});
+
 test('an invite nobody scans expires, is revoked, and leaves nothing on disk', async () => {
   // Expiry is whole seconds, so 1.5 s leaves at least half a second to connect first.
   const t = setup({ ttlMs: 1500 });
