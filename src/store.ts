@@ -31,13 +31,30 @@ function readJson<T>(file: string): T | null {
   }
 }
 
-// Written to a sibling temp file and renamed so a crash never leaves a torn file.
+// The file and then its folder are flushed, so after a power cut the new file is there, never a torn or older one.
 function writeText(file: string, text: string): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, text, { mode: 0o600 });
+  const fd = fs.openSync(tmp, 'w', 0o600);
+  try {
+    fs.writeSync(fd, text);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.chmodSync(tmp, 0o600);
   fs.renameSync(tmp, file);
+  syncDir(dir);
+}
+
+function syncDir(dir: string): void {
+  const fd = fs.openSync(dir, 'r');
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function writeJson(file: string, value: unknown): void {

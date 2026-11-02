@@ -15,7 +15,7 @@ Connects one Wizzle app to a NanoClaw install through the Wizzle relay. Node
 | `src/bridge.ts` | `WizzleBridge`: app packets to `BridgeHost` calls, runtime output to packets; capabilities follow the host's methods |
 | `src/pairing.ts` | `PairingManager`: one-time invites, pinning the app, expiry, `unpair()` |
 | `src/relay-client.ts` | One relay connection: handshake, encryption, outbox, reconnect |
-| `src/store.ts` | `pairing.json`, `session.json`, `invite.txt` (0600, atomic writes) |
+| `src/store.ts` | `pairing.json`, `session.json`, `invite.txt` (0600, atomic writes flushed to disk) |
 | `src/history.ts` | NanoClaw mailbox rows to chat history; a room's history merges its member sessions |
 | `src/rooms.ts` | Room ids and `RoomRouter`: fans messages out to member channels, flags mentions, caps handoffs |
 | `src/qr.ts` | QR encoder for the invite in the terminal |
