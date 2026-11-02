@@ -11,7 +11,12 @@ import { isContainerRunning, killContainer } from '../container-runner.js';
 import { getAgentGroup, getAgentGroupByFolder, getAllAgentGroups } from '../db/agent-groups.js';
 import { getDb, hasTable } from '../db/connection.js';
 import { getContainerConfig } from '../db/container-configs.js';
-import { getMessagingGroupAgents, getMessagingGroupByPlatform, getMessagingGroupsByAgentGroup } from '../db/messaging-groups.js';
+import {
+  getMessagingGroupAgents,
+  getMessagingGroupByPlatform,
+  getMessagingGroupsByAgentGroup,
+  getMessagingGroupsByChannel,
+} from '../db/messaging-groups.js';
 import {
   deletePendingApproval,
   deletePendingQuestion,
@@ -47,13 +52,23 @@ import {
   BridgeStore,
   DEFAULT_RELAY_URL,
   INVITE_TTL_MS,
+  NOTE_FIELD,
   PairingManager,
+  ROOM_ARCHIVE_MAX,
+  RoomRouter,
   SYSTEM_CONV,
   WizzleBridge,
   historyMessages,
   inviteText,
   isRelayUrl,
+  isRoomConv,
+  memberChannel,
+  mergeRoomMessages,
+  newRoomId,
+  parseRoom,
   parseTimestamp,
+  roomConv,
+  roomHistoryMessages,
   taskEchoOrigins,
   webSocketTransport,
 } from './wizzle/index.js';
@@ -67,17 +82,25 @@ import type {
   HostDeleted,
   HostHistory,
   HostQuestion,
+  HostRoom,
+  HostRoomChanges,
+  InboundAttachment,
   IssuedInvite,
   MailboxRow,
+  RoomInbound,
+  RoomMember,
+  RoomSessionRows,
 } from './wizzle/index.js';
 import { nodeCrypto } from './wizzle/protocol/crypto-node.js';
 import {
+  mentionHandle,
   type QuestionOption,
   type Secret,
   type SecretChanges,
   type SecretInjection,
   type SecretInput,
   type SecretType,
+  type Task,
   type TemplateInfo,
 } from './wizzle/protocol/index.js';
 
@@ -102,7 +125,8 @@ const SECRET_TYPES: SecretType[] = ['generic', 'anthropic', 'openai'];
 const WIZZLE_DEFAULTS: ChannelDefaults = {
   dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'public' },
   group: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'public' },
-  mentions: 'never',
+  // Room channels are wired engage_mode 'mention'; the default and topic wirings stay 'pattern'.
+  mentions: 'platform',
 };
 
 export function platformIdForAgent(agentGroupId: string): string {
@@ -181,9 +205,9 @@ function isWizzleGroup(group: MessagingGroup): boolean {
   return group.channel_type === CHANNEL_TYPE && (group.instance ?? group.channel_type) === CHANNEL_TYPE;
 }
 
-// A topic is never the default, so the setup wiring `wizzle:wizzle` still counts as one.
+// Neither a topic nor a room channel is the default, so the setup wiring `wizzle:wizzle` still counts as one.
 function isDefaultWizzleGroup(group: MessagingGroup): boolean {
-  return isWizzleGroup(group) && !isTopicConv(group.platform_id);
+  return isWizzleGroup(group) && !isTopicConv(group.platform_id) && parseRoom(group.platform_id) === undefined;
 }
 
 // The agent's conversation is whatever wizzle messaging group is wired to it, created on demand.
@@ -331,6 +355,275 @@ async function toHostConversation(agent: AgentGroup, group: MessagingGroup): Pro
     ...(lastAt !== undefined && { lastAt }),
     ...(createdAt !== undefined && { createdAt }),
   };
+}
+
+// A room is its members' wired channels, in the order they joined; the first channel's name is its title.
+type RoomSeat = { agent: AgentGroup; group: MessagingGroup };
+
+async function roomSeats(roomId?: string): Promise<Map<string, RoomSeat[]>> {
+  const rooms = new Map<string, RoomSeat[]>();
+  for (const group of await getMessagingGroupsByChannel(CHANNEL_TYPE)) {
+    const parsed = isWizzleGroup(group) ? parseRoom(group.platform_id) : undefined;
+    const agentGroupId = parsed?.agentGroupId;
+    if (!parsed || agentGroupId === undefined || (roomId !== undefined && parsed.roomId !== roomId)) continue;
+    const wired = (await getMessagingGroupAgents(group.id)).some((wiring) => wiring.agent_group_id === agentGroupId);
+    const agent = wired ? await getAgentGroup(agentGroupId) : undefined;
+    if (!agent) continue;
+    const seats = rooms.get(parsed.roomId) ?? [];
+    seats.push({ agent, group });
+    rooms.set(parsed.roomId, seats);
+  }
+  for (const seats of rooms.values()) {
+    seats.sort((a, b) => a.group.created_at.localeCompare(b.group.created_at) || a.agent.id.localeCompare(b.agent.id));
+  }
+  return rooms;
+}
+
+async function seatsOf(conv: string): Promise<{ roomId: string; seats: RoomSeat[] }> {
+  const parsed = parseRoom(conv);
+  if (!parsed || parsed.agentGroupId !== undefined) throw coded('unknown_conv', 'No such room');
+  const seats = (await roomSeats(parsed.roomId)).get(parsed.roomId) ?? [];
+  if (seats.length === 0) throw coded('unknown_conv', 'No such room');
+  return { roomId: parsed.roomId, seats };
+}
+
+async function toHostRoom(roomId: string, seats: RoomSeat[]): Promise<HostRoom> {
+  let lastAt: number | undefined;
+  for (const { agent, group } of seats) {
+    const at = parseTimestamp((await findSessionForAgent(agent.id, group.id, null))?.last_active);
+    if (at !== undefined && (lastAt === undefined || at > lastAt)) lastAt = at;
+  }
+  const createdAt = parseTimestamp(seats[0]?.group.created_at);
+  return {
+    conv: roomConv(roomId),
+    title: seats[0]?.group.name ?? 'Room',
+    members: seats.map((seat) => seat.agent.id),
+    ...(lastAt !== undefined && { lastAt }),
+    ...(createdAt !== undefined && { createdAt }),
+  };
+}
+
+export async function listRooms(): Promise<HostRoom[]> {
+  const out: HostRoom[] = [];
+  for (const [roomId, seats] of await roomSeats()) out.push(await toHostRoom(roomId, seats));
+  return out.sort((a, b) => (b.lastAt ?? 0) - (a.lastAt ?? 0));
+}
+
+export async function roomMembers(conv: string): Promise<RoomMember[]> {
+  const parsed = parseRoom(conv);
+  if (!parsed || parsed.agentGroupId !== undefined) return [];
+  const seats = (await roomSeats(parsed.roomId)).get(parsed.roomId) ?? [];
+  return seats.map(({ agent, group }) => ({ agentGroupId: agent.id, name: agent.name, channel: group.platform_id }));
+}
+
+async function roomAgents(ids: string[]): Promise<AgentGroup[]> {
+  const agents: AgentGroup[] = [];
+  for (const id of ids) {
+    if (id === SYSTEM_AGENT_ID) throw coded('bad_request', 'System cannot join a room');
+    const agent = await getAgentGroup(id);
+    if (!agent) throw coded('unknown_agent', 'No such agent');
+    agents.push(agent);
+  }
+  return agents;
+}
+
+// Wired 'mention', a member wakes only when named; 'accumulate' keeps the rest it is sent as context.
+async function seatAgent(roomId: string, agent: AgentGroup, title: string): Promise<void> {
+  const platformId = memberChannel(roomId, agent.id);
+  await hostCommand('messaging-groups-create', {
+    channel_type: CHANNEL_TYPE,
+    instance: CHANNEL_TYPE,
+    platform_id: platformId,
+    name: title,
+    is_group: 1,
+  });
+  await hostCommand('wirings-create', {
+    channel_type: CHANNEL_TYPE,
+    instance: CHANNEL_TYPE,
+    platform_id: platformId,
+    agent_group_id: agent.id,
+    engage_mode: 'mention',
+    ignored_message_policy: 'accumulate',
+    session_mode: 'shared',
+  });
+}
+
+// The same steps as deleting a topic, for one member's channel.
+async function unseat(roomId: string, agent: AgentGroup): Promise<string[]> {
+  const group = await getMessagingGroupByPlatform(CHANNEL_TYPE, memberChannel(roomId, agent.id), CHANNEL_TYPE);
+  if (!group) return [];
+  const session = await findSessionForAgent(agent.id, group.id, null);
+  const busy = `${agent.name} is still working in this room, try again in a moment`;
+  const questionIds = session ? await dropSession(agent.id, session, busy, 'wizzle room member removed') : [];
+  await removeCompanionDestination(agent.id, group.id);
+  for (const wiring of await getMessagingGroupAgents(group.id)) await hostCommand('wirings-delete', { id: wiring.id });
+  await hostCommand('messaging-groups-delete', { id: group.id });
+  return questionIds;
+}
+
+async function seatRows(seat: RoomSeat, limit: number): Promise<RoomSessionRows | undefined> {
+  const session = await findSessionForAgent(seat.agent.id, seat.group.id, null);
+  if (!session) return undefined;
+  const rows = await withExistingMailboxSession(seat.agent.id, session.id, (mailbox) => ({
+    inbound: mailbox.getInboundHistory(limit),
+    outbound: mailbox.getOutboundHistory(limit),
+  }));
+  if (!rows) return undefined;
+  const delivered = await taskDeliveries(seat.agent.id, taskEchoOrigins(rows.inbound), limit);
+  return { agentGroupId: seat.agent.id, inbound: rows.inbound, outbound: rows.outbound, delivered };
+}
+
+// A member leaving takes its session, so what it saw is kept and the room's history still shows it.
+async function archiveSeat(store: BridgeStore, roomId: string, seat: RoomSeat): Promise<void> {
+  const rows = await seatRows(seat, ROOM_ARCHIVE_MAX);
+  if (!rows) return;
+  const seen = roomHistoryMessages(roomConv(roomId), [rows], [], ROOM_ARCHIVE_MAX);
+  store.saveRoomArchive(roomId, mergeRoomMessages([store.loadRoomArchive(roomId), seen], ROOM_ARCHIVE_MAX));
+}
+
+function roomNote(title: string, seats: RoomSeat[], self: string): string {
+  const names = seats.map(({ agent }) => {
+    const handle = mentionHandle(agent.name);
+    const label = handle === agent.name ? `@${handle}` : `@${handle} (${agent.name})`;
+    return agent.id === self ? `${label}, that is you` : label;
+  });
+  return [
+    `This is the wizzle room "${title}". Members: ${names.join('; ')}. The owner writes here as ${SENDER_NAME}.`,
+    'You wake only when a message names you with @ or says @all; everything else said here reaches you as context. Follow the wizzle-rooms skill.',
+  ].join('\n');
+}
+
+// Written as context only, so it never wakes anyone; history leaves it out.
+async function writeRoomNotes(roomId: string): Promise<void> {
+  const seats = (await roomSeats(roomId)).get(roomId) ?? [];
+  const title = seats[0]?.group.name ?? 'Room';
+  for (const seat of seats) {
+    try {
+      const { session } = await resolveSession(seat.agent.id, seat.group.id, null, 'shared');
+      await writeSessionMessage(seat.agent.id, session.id, {
+        id: `wizzle-room-note-${randomUUID()}`,
+        kind: 'chat',
+        timestamp: new Date().toISOString(),
+        platformId: seat.group.platform_id,
+        channelType: CHANNEL_TYPE,
+        threadId: null,
+        content: JSON.stringify({ text: roomNote(title, seats, seat.agent.id), sender: 'system', senderId: 'system', [NOTE_FIELD]: 'members' }),
+        trigger: false,
+      });
+    } catch (err) {
+      log.warn('wizzle: could not write the room note', { room: roomId, agent: seat.agent.id, err });
+    }
+  }
+}
+
+export async function createRoom(title: string, ids: string[]): Promise<HostRoom> {
+  const agents = await roomAgents(ids);
+  const roomId = newRoomId();
+  let seated = 0;
+  try {
+    for (const agent of agents) {
+      await seatAgent(roomId, agent, title);
+      seated += 1;
+    }
+  } catch (err) {
+    // The member that failed may have its channel without a wiring, so it is taken down as well.
+    for (const agent of agents.slice(0, seated + 1)) {
+      await unseat(roomId, agent).catch((undo: unknown) => log.warn('wizzle: could not undo a room member', { room: roomId, agent: agent.id, err: undo }));
+    }
+    throw coded('create_failed', err instanceof Error ? err.message : 'The room was not created');
+  }
+  await writeRoomNotes(roomId);
+  return toHostRoom(roomId, (await roomSeats(roomId)).get(roomId) ?? []);
+}
+
+async function updateRoom(store: BridgeStore, conv: string, changes: HostRoomChanges): Promise<HostRoom> {
+  const { roomId, seats } = await seatsOf(conv);
+  const title = changes.title ?? seats[0]?.group.name ?? 'Room';
+  if (changes.title !== undefined) {
+    for (const seat of seats) await hostCommand('messaging-groups-update', { id: seat.group.id, name: changes.title });
+  }
+  const members = changes.members;
+  if (members !== undefined) {
+    const wanted = await roomAgents(members);
+    for (const seat of seats) {
+      if (members.includes(seat.agent.id)) continue;
+      await archiveSeat(store, roomId, seat);
+      await unseat(roomId, seat.agent);
+    }
+    for (const agent of wanted) if (!seats.some((seat) => seat.agent.id === agent.id)) await seatAgent(roomId, agent, title);
+  }
+  await writeRoomNotes(roomId);
+  return toHostRoom(roomId, (await roomSeats(roomId)).get(roomId) ?? []);
+}
+
+async function deleteRoom(rooms: RoomDeps, conv: string): Promise<HostDeleted> {
+  const { roomId, seats } = await seatsOf(conv);
+  const questionIds: string[] = [];
+  for (const seat of seats) questionIds.push(...(await unseat(roomId, seat.agent)));
+  rooms.store.dropRoomArchive(roomId);
+  rooms.router.forget(conv);
+  return { questionIds };
+}
+
+// Every member's room session goes, then fresh notes, so the next message finds the members listed again.
+async function clearRoom(rooms: RoomDeps, conv: string): Promise<HostDeleted> {
+  const { roomId, seats } = await seatsOf(conv);
+  const live: Array<{ seat: RoomSeat; session: AgentSession }> = [];
+  for (const seat of seats) {
+    const session = await findSessionForAgent(seat.agent.id, seat.group.id, null);
+    if (session) live.push({ seat, session });
+  }
+  let tasks = 0;
+  for (const { seat, session } of live) {
+    tasks += (await withExistingMailboxSession(seat.agent.id, session.id, (mailbox) => mailbox.listLiveTasks().length)) ?? 0;
+  }
+  if (tasks > 0) {
+    const one = tasks === 1;
+    throw coded('has_tasks', `This room holds ${tasks} scheduled ${one ? 'task' : 'tasks'}; cancel ${one ? 'it' : 'them'} before clearing.`);
+  }
+  const questionIds: string[] = [];
+  for (const { seat, session } of live) {
+    const busy = `${seat.agent.name} is still working in this room, try again in a moment`;
+    questionIds.push(...(await dropSession(seat.agent.id, session, busy, 'wizzle room cleared')));
+  }
+  rooms.store.dropRoomArchive(roomId);
+  rooms.router.forget(conv);
+  await writeRoomNotes(roomId);
+  return { questionIds };
+}
+
+async function roomHistory(store: BridgeStore, conv: string, limit: number): Promise<HostHistory> {
+  const parsed = parseRoom(conv);
+  if (!parsed) return { messages: [], hasMore: false };
+  const sessions: RoomSessionRows[] = [];
+  let full = false;
+  for (const seat of (await roomSeats(parsed.roomId)).get(parsed.roomId) ?? []) {
+    const rows = await seatRows(seat, limit);
+    if (!rows) continue;
+    sessions.push(rows);
+    if (rows.inbound.length >= limit || rows.outbound.length >= limit) full = true;
+  }
+  const messages = roomHistoryMessages(conv, sessions, store.loadRoomArchive(parsed.roomId), ROOM_ARCHIVE_MAX);
+  return { messages: messages.slice(-limit), hasMore: full || messages.length > limit };
+}
+
+async function sessionActivity(agentGroupId: string, session: AgentSession | undefined): Promise<HostActivity> {
+  if (!session) return { running: false };
+  const state = await withExistingMailboxSession(agentGroupId, session.id, (mailbox) => mailbox.getContainerState());
+  const toolStartedAt = parseTimestamp(state?.toolStartedAt);
+  return {
+    running: session.container_status === 'running',
+    ...(state?.currentTool && { tool: state.currentTool }),
+    ...(toolStartedAt !== undefined && { toolStartedAt }),
+    ...(state?.toolDeclaredTimeoutMs && { timeoutMs: state.toolDeclaredTimeoutMs }),
+  };
+}
+
+async function roomActivity(conv: string, speaker: string | undefined): Promise<HostActivity> {
+  const parsed = parseRoom(conv);
+  if (!parsed || speaker === undefined) return { running: false };
+  const group = await getMessagingGroupByPlatform(CHANNEL_TYPE, memberChannel(parsed.roomId, speaker), CHANNEL_TYPE);
+  return sessionActivity(speaker, group ? await findSessionForAgent(speaker, group.id, null) : undefined);
 }
 
 // Two taps on Create must not race for the same folder or display name.
@@ -604,6 +897,44 @@ function toInjection(raw: unknown): SecretInjection | undefined {
   return undefined;
 }
 
+// A tasks-list row: the series id doubles as the name, and a task without a cron expression runs once.
+function toTask(row: unknown): Task | undefined {
+  if (!isRecord(row) || typeof row.series_id !== 'string' || typeof row.agent_group_id !== 'string') return undefined;
+  const lastRunAt = parseTimestamp(typeof row.last_run === 'string' ? row.last_run : undefined);
+  const nextRunAt = parseTimestamp(typeof row.next_run === 'string' ? row.next_run : undefined);
+  return {
+    id: row.series_id,
+    agentId: row.agent_group_id,
+    name: row.series_id,
+    schedule: typeof row.recurrence === 'string' && row.recurrence.length > 0 ? row.recurrence : 'once',
+    enabled: row.status === 'pending',
+    ...(typeof row.prompt === 'string' && { prompt: row.prompt }),
+    ...(typeof row.runs === 'number' && { runs: row.runs }),
+    ...(typeof row.failed_runs === 'number' && { failedRuns: row.failed_runs }),
+    ...(lastRunAt !== undefined && { lastRunAt }),
+    ...(nextRunAt !== undefined && { nextRunAt }),
+  };
+}
+
+// Without a group, tasks-list reads every active session, so tasks scheduled from a chat before ncl tasks list too.
+export async function listTasks(): Promise<Task[]> {
+  const rows = await hostCommand('tasks-list', {});
+  return (Array.isArray(rows) ? rows : []).map(toTask).filter((task): task is Task => task !== undefined);
+}
+
+// The host finds the series by id across sessions; an unknown id is its "no live task matched" error.
+export async function runTask(taskId: string): Promise<void> {
+  await hostCommand('tasks-run', { id: taskId });
+}
+
+export async function pauseTask(taskId: string): Promise<void> {
+  await hostCommand('tasks-pause', { id: taskId });
+}
+
+export async function resumeTask(taskId: string): Promise<void> {
+  await hostCommand('tasks-resume', { id: taskId });
+}
+
 // Only what wizzle shows; OneCLI never lists a value.
 function toSecret(row: unknown): Secret | undefined {
   if (!isRecord(row) || typeof row.id !== 'string' || typeof row.name !== 'string' || typeof row.hostPattern !== 'string') return undefined;
@@ -793,6 +1124,9 @@ function settingUpText(name: string, skippedPackages: string[]): string {
 
 type Notify = (conv: string, text: string) => void;
 
+// What rooms need beyond the host DB: the archive of members that left, and the router fanning messages out.
+export type RoomDeps = { store: BridgeStore; router: RoomRouter };
+
 export async function createAgent(request: HostCreateAgent, notify: Notify): Promise<HostAgent> {
   const name = request.name.trim();
   await assertNameFree(name);
@@ -856,7 +1190,7 @@ export async function createAgent(request: HostCreateAgent, notify: Notify): Pro
   return agent;
 }
 
-export function createHost(notify: Notify): BridgeHost {
+export function createHost(notify: Notify, rooms?: RoomDeps): BridgeHost {
   return {
     runtime: 'nanoclaw',
     hostName: INSTALL_SLUG,
@@ -887,6 +1221,7 @@ export function createHost(notify: Notify): BridgeHost {
     },
 
     async history(conv, limit): Promise<HostHistory> {
+      if (rooms && isRoomConv(conv)) return roomHistory(rooms.store, conv, limit);
       const target = await targetFor(conv);
       if (!target?.session) return { messages: [], hasMore: false };
       const rows = await withExistingMailboxSession(target.agentGroupId, target.session.id, (mailbox) => ({
@@ -900,17 +1235,10 @@ export function createHost(notify: Notify): BridgeHost {
       return { messages: messages.slice(-limit), hasMore };
     },
 
-    async activity(conv): Promise<HostActivity> {
+    async activity(conv, speaker): Promise<HostActivity> {
+      if (isRoomConv(conv)) return roomActivity(conv, speaker);
       const target = await targetFor(conv);
-      if (!target?.session) return { running: false };
-      const state = await withExistingMailboxSession(target.agentGroupId, target.session.id, (mailbox) => mailbox.getContainerState());
-      const toolStartedAt = parseTimestamp(state?.toolStartedAt);
-      return {
-        running: target.session.container_status === 'running',
-        ...(state?.currentTool && { tool: state.currentTool }),
-        ...(toolStartedAt !== undefined && { toolStartedAt }),
-        ...(state?.toolDeclaredTimeoutMs && { timeoutMs: state.toolDeclaredTimeoutMs }),
-      };
+      return target ? sessionActivity(target.agentGroupId, target.session) : { running: false };
     },
 
     async questionRender(questionId): Promise<HostQuestion | undefined> {
@@ -925,7 +1253,22 @@ export function createHost(notify: Notify): BridgeHost {
 
     listTemplates,
 
+    listTasks,
+    runTask,
+    pauseTask,
+    resumeTask,
+
     ...(usesOneCli() && { listSecrets, createSecret, updateSecret, deleteSecret, listAgentSecrets, attachSecret, detachSecret }),
+
+    ...(rooms && {
+      listRooms,
+      createRoom,
+      updateRoom: (conv: string, changes: HostRoomChanges) => updateRoom(rooms.store, conv, changes),
+      deleteRoom: (conv: string) => deleteRoom(rooms, conv),
+      async continueRoom(conv: string): Promise<void> {
+        await rooms.router.continue(conv);
+      },
+    }),
 
     async listConversations(): Promise<HostConversation[]> {
       const out: HostConversation[] = [];
@@ -1018,6 +1361,7 @@ export function createHost(notify: Notify): BridgeHost {
 
     // The wiring and messaging group stay, so the next message opens a fresh session.
     async clearConversation(conv): Promise<HostDeleted> {
+      if (rooms && isRoomConv(conv)) return clearRoom(rooms, conv);
       const target = await targetFor(conv);
       if (!target) throw coded('unknown_conv', 'No such conversation');
       const { agentGroupId, session } = target;
@@ -1071,6 +1415,16 @@ export function createHost(notify: Notify): BridgeHost {
       const questionIds: string[] = [];
       for (const session of sessions) questionIds.push(...(await clearPendingForSession(session.id)));
       const wizzleGroups = await wizzleGroupsFor(group.id);
+      // Its rooms keep what it said there; groups-delete then takes its room channels with the rest.
+      const leftRooms: string[] = [];
+      if (rooms) {
+        for (const [roomId, seats] of await roomSeats()) {
+          const seat = seats.find((one) => one.agent.id === group.id);
+          if (!seat) continue;
+          leftRooms.push(roomId);
+          await archiveSeat(rooms.store, roomId, seat);
+        }
+      }
       try {
         await hostCommand('groups-delete', { id: group.id });
       } catch (err) {
@@ -1084,6 +1438,10 @@ export function createHost(notify: Notify): BridgeHost {
         } catch (err) {
           log.warn('wizzle: could not remove a deleted agent\'s conversation', { conv: messagingGroup.platform_id, err });
         }
+      }
+      for (const roomId of leftRooms) {
+        if (((await roomSeats(roomId)).get(roomId) ?? []).length > 0) await writeRoomNotes(roomId);
+        else rooms?.store.dropRoomArchive(roomId);
       }
       if (removeWorkspace) {
         const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -1149,6 +1507,29 @@ register<{ replace: boolean }, IssuedInvite>({
   formatHuman: (issued) => inviteText(issued.url, issued.expiresAt),
 });
 
+function toAttachments(attachments: InboundAttachment[]): Array<Record<string, unknown>> {
+  return attachments.map((a) => ({ type: 'file', name: a.name, mimeType: a.mimeType, size: a.size, data: a.data }));
+}
+
+// isGroup matches the room channel's row; an agent's text keeps its own sender id, never the owner's.
+function injectRoomMessage(config: ChannelSetup | null, message: RoomInbound): void {
+  if (!config) {
+    log.warn('wizzle: a room message arrived before the channel started', { channel: message.channel });
+    return;
+  }
+  const content: Record<string, unknown> = { text: message.text, sender: message.sender, senderId: message.senderId, msgId: message.msgId };
+  if (message.note) content[NOTE_FIELD] = message.note;
+  if (message.attachments) content.attachments = toAttachments(message.attachments);
+  config.onInbound(message.channel, null, {
+    id: message.id,
+    kind: 'chat',
+    content,
+    timestamp: new Date().toISOString(),
+    isMention: message.isMention,
+    isGroup: true,
+  });
+}
+
 function createAdapter(): ChannelAdapter | null {
   const relay = relayUrl();
   if (!relay) {
@@ -1156,9 +1537,19 @@ function createAdapter(): ChannelAdapter | null {
     return null;
   }
   let bridge: WizzleBridge;
-  const host = createHost((conv, text) => bridge.notify(conv, text));
-  bridge = new WizzleBridge({ host, log });
+  let channel: ChannelSetup | null = null;
   const store = new BridgeStore(path.join(DATA_DIR, 'wizzle'));
+  const router = new RoomRouter({
+    owner: { sender: SENDER_NAME, senderId: OWNER_USER_ID },
+    hooks: {
+      members: roomMembers,
+      inject: (message) => injectRoomMessage(channel, message),
+      expect: (conv, speaker) => bridge.expect(conv, speaker),
+      hold: (conv, held) => bridge.holdRoom(conv, held),
+    },
+  });
+  const host = createHost((conv, text) => bridge.notify(conv, text), { store, router });
+  bridge = new WizzleBridge({ host, log });
   const manager = new PairingManager({
     bridge,
     store,
@@ -1179,6 +1570,7 @@ function createAdapter(): ChannelAdapter | null {
     defaults: WIZZLE_DEFAULTS,
 
     async setup(config: ChannelSetup): Promise<void> {
+      channel = config;
       manager.start();
       pairings = manager;
 
@@ -1186,16 +1578,12 @@ function createAdapter(): ChannelAdapter | null {
 
       const hooks: BridgeHooks = {
         onInbound(conv, message) {
-          const content: Record<string, unknown> = { text: message.text, sender: SENDER_NAME, senderId: OWNER_USER_ID, msgId: message.msgId };
-          if (message.attachments) {
-            content.attachments = message.attachments.map((a) => ({
-              type: 'file',
-              name: a.name,
-              mimeType: a.mimeType,
-              size: a.size,
-              data: a.data,
-            }));
+          if (isRoomConv(conv)) {
+            void router.fromOwner(conv, message).catch((err: unknown) => log.warn('wizzle: a room message was not passed on', { conv, err }));
+            return;
           }
+          const content: Record<string, unknown> = { text: message.text, sender: SENDER_NAME, senderId: OWNER_USER_ID, msgId: message.msgId };
+          if (message.attachments) content.attachments = toAttachments(message.attachments);
           void config.onInbound(conv, null, {
             id: message.id,
             kind: 'chat',
@@ -1213,6 +1601,7 @@ function createAdapter(): ChannelAdapter | null {
     },
 
     async teardown(): Promise<void> {
+      channel = null;
       pairings = null;
       manager.stop();
       bridge.stop();
@@ -1227,17 +1616,31 @@ function createAdapter(): ChannelAdapter | null {
       return SYSTEM_CONV;
     },
 
+    // A member channel's output shows in its room under that member, then goes on to the other members.
     async deliver(platformId: string, _threadId: string | null, message: OutboundMessage): Promise<string | undefined> {
-      return bridge.deliver(platformId, {
+      const outbound = {
         kind: message.kind,
         content: message.content,
         ...(message.id !== undefined && { id: message.id }),
         ...(message.files && { files: message.files.map((f) => ({ filename: f.filename, data: new Uint8Array(f.data) })) }),
-      });
+      };
+      const seat = parseRoom(platformId);
+      if (seat?.agentGroupId === undefined) return bridge.deliver(platformId, outbound);
+      const conv = roomConv(seat.roomId);
+      const delivered = await bridge.deliver(conv, { ...outbound, speaker: seat.agentGroupId });
+      // Without a messages_out id a copy could land twice, so such a delivery stays in the room only.
+      if (message.id !== undefined) {
+        await router
+          .fromAgent(conv, seat.agentGroupId, outbound)
+          .catch((err: unknown) => log.warn('wizzle: a room message was not passed on', { conv, err }));
+      }
+      return delivered;
     },
 
     async setTyping(platformId, _threadId, status, statusKind): Promise<void> {
-      await bridge.typing(platformId, status, statusKind);
+      const seat = parseRoom(platformId);
+      if (seat?.agentGroupId !== undefined) await bridge.typing(roomConv(seat.roomId), status, statusKind, seat.agentGroupId);
+      else await bridge.typing(platformId, status, statusKind);
     },
   };
 }

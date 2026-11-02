@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import {
   MAX_FILE_BYTES,
   PROTOCOL_VERSION,
+  ROOM_LIMITS,
   Session,
   decodePacket,
   encodePacket,
@@ -15,12 +16,14 @@ import {
   type FileMeta,
   type Packet,
   type QuestionOption,
+  type Room,
   type Secret,
   type SecretChanges,
   type SecretInjection,
   type SecretInput,
   type SecretType,
   type SessionState,
+  type Task,
   type TemplateInfo,
 } from '../../wizzle-protocol/src/index.ts';
 import { RelayClient, type Logger } from './relay-client.ts';
@@ -45,6 +48,7 @@ const MAX_SECRET_VALUE = 10_000;
 const MAX_AGENT_SECRETS = 64;
 const SECRET_TYPES: SecretType[] = ['generic', 'anthropic', 'openai'];
 const MSG_ID = /^[A-Za-z0-9_-]{1,64}$/;
+const MAX_AGENT_ID = 200;
 // NanoClaw refreshes typing every 4 seconds while the agent works; this long without one means it stopped.
 const ACTIVITY_SILENCE_MS = 12_000;
 
@@ -54,6 +58,9 @@ export type HostActivity = { running: boolean; tool?: string; toolStartedAt?: nu
 export type HostQuestion = { title: string; question?: string; options: QuestionOption[] };
 export type HostConversation = { conv: string; agentId: string; title: string; lastAt?: number; topic: boolean; createdAt?: number };
 export type HostDeleted = { questionIds?: string[] };
+export type HostRoom = { conv: string; title: string; members: string[]; lastAt?: number; createdAt?: number };
+// Only the fields present change; members replaces the whole list.
+export type HostRoomChanges = { title?: string; members?: string[] };
 // Everything wizzle can put in one create_agent, already validated by the bridge.
 export type HostCreateAgent = { name: string; purpose?: string; template?: string; copyFrom?: string; timezone?: string; secrets?: string[] };
 
@@ -64,7 +71,8 @@ export interface BridgeHost {
   readonly hostName: string;
   listAgents(): Promise<HostAgent[]>;
   history(conv: string, limit: number): Promise<HostHistory>;
-  activity(conv: string): Promise<HostActivity>;
+  // In a room, speaker names the member whose activity is asked for.
+  activity(conv: string, speaker?: string): Promise<HostActivity>;
   questionRender(questionId: string): Promise<HostQuestion | undefined>;
   createAgent?(request: HostCreateAgent): Promise<HostAgent>;
   listTemplates?(): Promise<TemplateInfo[]>;
@@ -87,6 +95,17 @@ export interface BridgeHost {
   listAgentSecrets?(agentId: string): Promise<string[]>;
   attachSecret?(agentId: string, secretId: string): Promise<void>;
   detachSecret?(agentId: string, secretId: string): Promise<void>;
+  // Scheduled tasks across every agent; a task id is unique on the host, so the three actions take only it.
+  listTasks?(): Promise<Task[]>;
+  runTask?(taskId: string): Promise<void>;
+  pauseTask?(taskId: string): Promise<void>;
+  resumeTask?(taskId: string): Promise<void>;
+  // Rooms; history, activity and clearConversation take a room's conv as well.
+  listRooms?(): Promise<HostRoom[]>;
+  createRoom?(title: string, members: string[]): Promise<HostRoom>;
+  updateRoom?(conv: string, changes: HostRoomChanges): Promise<HostRoom>;
+  deleteRoom?(conv: string): Promise<HostDeleted | void>;
+  continueRoom?(conv: string): Promise<void>;
 }
 
 export type InboundAttachment = { name: string; mimeType: string; size: number; data: string };
@@ -101,7 +120,8 @@ export type BridgeHooks = {
 
 export type OutboundFile = { filename: string; data: Uint8Array };
 // id is the runtime's own id for the message; it becomes the msgId so history and live rows match.
-export type Outbound = { kind: string; content: unknown; files?: OutboundFile[]; id?: string };
+// speaker is the room member that produced it.
+export type Outbound = { kind: string; content: unknown; files?: OutboundFile[]; id?: string; speaker?: string };
 
 export type PairingLink = {
   id: string;
@@ -118,13 +138,19 @@ export type PairingLink = {
 };
 
 type Upload = { file: FileMeta; bytes: Uint8Array; at: number };
+// A reply wizzle is waiting on; in a room there is one per woken member.
+type Turn = { conv: string; speaker?: string };
 type Link = { id: string; client: RelayClient; uploads: Map<string, Upload>; uploadBytes: number };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function mimeFor(name: string): string {
+function turnKey(conv: string, speaker?: string): string {
+  return speaker === undefined ? conv : `${conv}\n${speaker}`;
+}
+
+export function mimeFor(name: string): string {
   const ext = name.toLowerCase().split('.').pop() ?? '';
   const table: Record<string, string> = {
     png: 'image/png',
@@ -150,12 +176,14 @@ export class WizzleBridge {
   private readonly host: BridgeHost;
   private readonly log: Logger;
   private readonly links = new Map<string, Link>();
-  private readonly awaiting = new Set<string>();
+  private readonly awaiting = new Map<string, Turn>();
   private readonly lastActivity = new Map<string, string>();
   private readonly silence = new Map<string, ReturnType<typeof setTimeout>>();
-  private readonly questionConv = new Map<string, string>();
+  private readonly questionConv = new Map<string, Turn>();
+  private readonly holds = new Map<string, string[]>();
   private agents: HostAgent[] = [];
   private convs: HostConversation[] = [];
+  private rooms: HostRoom[] = [];
   private hooks: BridgeHooks | null = null;
   readonly capabilities: Capabilities;
 
@@ -166,7 +194,7 @@ export class WizzleBridge {
       streaming: false,
       questions: true,
       approvals: true,
-      tasks: false,
+      tasks: [opts.host.listTasks, opts.host.runTask, opts.host.pauseTask, opts.host.resumeTask].every((method) => typeof method === 'function'),
       files: true,
       history: true,
       clearSession: typeof opts.host.clearConversation === 'function',
@@ -192,6 +220,9 @@ export class WizzleBridge {
         opts.host.attachSecret,
         opts.host.detachSecret,
       ].every((method) => typeof method === 'function'),
+      rooms: [opts.host.listRooms, opts.host.createRoom, opts.host.updateRoom, opts.host.deleteRoom, opts.host.continueRoom, opts.host.clearConversation].every(
+        (method) => typeof method === 'function',
+      ),
       ...opts.capabilities,
     };
   }
@@ -259,6 +290,9 @@ export class WizzleBridge {
     await this.announceConv(conv);
     const at = Date.now();
     const content = message.content;
+    const speaker = message.speaker;
+    const said = speaker !== undefined ? { speaker } : {};
+    const turn = turnKey(conv, speaker);
     let firstId: string | undefined;
     let wake = false;
     const emit = (packet: BridgeMessage, body?: Uint8Array) => {
@@ -268,9 +302,9 @@ export class WizzleBridge {
       return id;
     };
     const finishTurn = () => {
-      this.awaiting.delete(conv);
-      this.clearSilence(conv);
-      this.sendActivity({ conv, state: 'idle' });
+      this.awaiting.delete(turn);
+      this.clearSilence(turn);
+      this.sendActivity({ conv, state: 'idle', ...said });
     };
 
     if (isRecord(content) && content.type === 'ask_question' && typeof content.questionId === 'string') {
@@ -284,8 +318,9 @@ export class WizzleBridge {
         question: render?.question ?? (typeof content.question === 'string' ? content.question : ''),
         options,
         ...(render?.title ? { title: render.title } : typeof content.title === 'string' ? { title: content.title } : {}),
+        ...said,
       };
-      this.questionConv.set(questionId, conv);
+      this.questionConv.set(questionId, { conv, ...said });
       emit({ t: 'question', question });
       finishTurn();
       this.wakeWizzle();
@@ -293,12 +328,12 @@ export class WizzleBridge {
     }
 
     if (isRecord(content) && content.operation === 'edit' && typeof content.messageId === 'string') {
-      const target = this.questionConv.get(content.messageId) ?? conv;
+      const target = this.questionConv.get(content.messageId)?.conv ?? conv;
       const terminal = isRecord(content.terminalCard) && typeof content.terminalCard.resolution === 'string'
         ? { resolution: content.terminalCard.resolution }
         : undefined;
       const text = typeof content.text === 'string' ? content.text : (terminal?.resolution ?? '');
-      emit({ t: 'edit', conv: target, msgId: content.messageId, text, format: 'markdown', ...(terminal && { terminal }) });
+      emit({ t: 'edit', conv: target, msgId: content.messageId, text, format: 'markdown', ...(terminal && { terminal }), ...said });
       if (terminal) {
         this.questionConv.delete(content.messageId);
         emit({ t: 'question_resolved', questionId: content.messageId, value: terminal.resolution });
@@ -316,13 +351,13 @@ export class WizzleBridge {
     if (isRecord(content) && content.card !== undefined) {
       const fallbackText = typeof content.fallbackText === 'string' ? content.fallbackText : '';
       const msgId = message.id ?? randomUUID();
-      emit({ t: 'card', conv, msgId, card: content.card, fallbackText, at });
+      emit({ t: 'card', conv, msgId, card: content.card, fallbackText, at, ...said });
       firstId ??= msgId;
     } else {
       const text = extractText(content);
       if (text !== null && text.length > 0) {
         const msgId = message.id ?? randomUUID();
-        emit({ t: 'message', message: { conv, msgId, role: 'agent', text, format: 'markdown', at } });
+        emit({ t: 'message', message: { conv, msgId, role: 'agent', text, format: 'markdown', at, ...said } });
         firstId ??= msgId;
       }
     }
@@ -337,7 +372,7 @@ export class WizzleBridge {
       }
       const msgId = message.id !== undefined ? `${message.id}:f${index}` : randomUUID();
       const meta: FileMeta = { name: file.filename, mime: mimeFor(file.filename), size: file.data.length };
-      emit({ t: 'file', conv, msgId, file: meta, at }, file.data);
+      emit({ t: 'file', conv, msgId, file: meta, at, ...said }, file.data);
       firstId ??= msgId;
     });
 
@@ -359,12 +394,13 @@ export class WizzleBridge {
   }
 
   // Runtime typing signal. Only sent while wizzle is online, and only when it changes.
-  async typing(conv: string, status?: string, statusKind?: 'auto' | 'agent'): Promise<void> {
-    if (!this.awaiting.has(conv) && statusKind !== 'agent') return;
+  async typing(conv: string, status?: string, statusKind?: 'auto' | 'agent', speaker?: string): Promise<void> {
+    const turn = turnKey(conv, speaker);
+    if (!this.awaiting.has(turn) && statusKind !== 'agent') return;
     if (!this.peerOnline) return;
-    const host = await this.host.activity(conv);
+    const host = await this.host.activity(conv, speaker);
     // The reply can be delivered during the read; a "thinking" sent after its idle would never clear.
-    if (!this.awaiting.has(conv) && statusKind !== 'agent') return;
+    if (!this.awaiting.has(turn) && statusKind !== 'agent') return;
     const activity: Activity = {
       conv,
       state: host.tool ? 'tool' : 'thinking',
@@ -372,40 +408,57 @@ export class WizzleBridge {
       ...(statusKind === 'agent' && status && { label: status }),
       ...(host.toolStartedAt && { startedAt: host.toolStartedAt }),
       ...(host.timeoutMs && { timeoutMs: host.timeoutMs }),
+      ...(speaker !== undefined && { speaker }),
     };
     this.sendActivity(activity);
-    this.armSilence(conv);
+    this.armSilence(conv, speaker);
+  }
+
+  // A message that wakes an agent: its typing and reply in the conversation are now expected.
+  expect(conv: string, speaker?: string): void {
+    const turn = turnKey(conv, speaker);
+    this.awaiting.set(turn, { conv, ...(speaker !== undefined && { speaker }) });
+    this.resetActivity(turn);
+  }
+
+  // A room's handoff hold as its router reports it; an empty list clears it.
+  holdRoom(conv: string, held: string[]): void {
+    if (held.length > 0) this.holds.set(conv, [...held]);
+    else if (!this.holds.delete(conv)) return;
+    this.broadcast({ t: 'room_hold', conv, held: [...held], id: randomUUID() });
   }
 
   // Only an activity that reached wizzle counts as sent, so a repeat after a reconnect is not swallowed.
   private sendActivity(activity: Activity): void {
     if (!this.peerOnline) return;
     const key = JSON.stringify(activity);
-    if (this.lastActivity.get(activity.conv) === key) return;
-    this.lastActivity.set(activity.conv, key);
+    const turn = turnKey(activity.conv, activity.speaker);
+    if (this.lastActivity.get(turn) === key) return;
+    this.lastActivity.set(turn, key);
     this.broadcast({ ...activity_packet(activity), id: randomUUID() });
   }
 
   // A turn that ends without a reply (a reaction, an edit) sends no idle, so typing going quiet stands in for it.
-  private armSilence(conv: string): void {
-    this.clearSilence(conv);
+  private armSilence(conv: string, speaker?: string): void {
+    const turn = turnKey(conv, speaker);
+    this.clearSilence(turn);
     const timer = setTimeout(() => {
-      this.silence.delete(conv);
-      this.sendActivity({ conv, state: 'idle' });
+      this.silence.delete(turn);
+      this.sendActivity({ conv, state: 'idle', ...(speaker !== undefined && { speaker }) });
     }, ACTIVITY_SILENCE_MS);
     timer.unref?.();
-    this.silence.set(conv, timer);
+    this.silence.set(turn, timer);
   }
 
-  private clearSilence(conv: string): void {
-    clearTimeout(this.silence.get(conv));
-    this.silence.delete(conv);
+  private clearSilence(turn: string): void {
+    clearTimeout(this.silence.get(turn));
+    this.silence.delete(turn);
   }
 
-  // A new turn, or the end of one, starts the conversation's activity over.
-  private resetActivity(conv: string): void {
-    this.lastActivity.delete(conv);
-    this.clearSilence(conv);
+  // A new turn, or the end of one, starts its activity over.
+  private resetActivity(turn: string): void {
+    this.lastActivity.delete(turn);
+    this.clearSilence(turn);
   }
 
   private broadcast(packet: Packet<BridgeMessage>, body?: Uint8Array): void {
@@ -443,16 +496,28 @@ export class WizzleBridge {
     return this.convs;
   }
 
+  private async refreshRooms(): Promise<HostRoom[]> {
+    this.rooms = this.capabilities.rooms && this.host.listRooms ? await this.host.listRooms() : [];
+    return this.rooms;
+  }
+
+  private async knownRoom(conv: string): Promise<boolean> {
+    if (this.rooms.some((r) => r.conv === conv)) return true;
+    return (await this.refreshRooms()).some((r) => r.conv === conv);
+  }
+
   private async knownConv(conv: string): Promise<boolean> {
     if (conv === SYSTEM_CONV) return true;
     if (this.convs.some((c) => c.conv === conv)) return true;
-    return (await this.refreshConvs()).some((c) => c.conv === conv);
+    if ((await this.refreshConvs()).some((c) => c.conv === conv)) return true;
+    return this.knownRoom(conv);
   }
 
-  // A conversation wired after the last catalog is announced before its first message.
+  // A conversation or room made after the last catalog is announced before its first message.
   private async announceConv(conv: string): Promise<void> {
-    if (conv === SYSTEM_CONV || this.convs.some((c) => c.conv === conv)) return;
-    if (!(await this.refreshConvs()).some((c) => c.conv === conv)) return;
+    if (conv === SYSTEM_CONV || this.convs.some((c) => c.conv === conv) || this.rooms.some((r) => r.conv === conv)) return;
+    const wired = (await this.refreshConvs()).some((c) => c.conv === conv) || (await this.refreshRooms()).some((r) => r.conv === conv);
+    if (!wired) return;
     for (const link of this.links.values()) await this.sendCatalog(link);
   }
 
@@ -466,6 +531,13 @@ export class WizzleBridge {
     }
     conversations.push({ id: SYSTEM_CONV, agentId: SYSTEM_AGENT.id, title: SYSTEM_AGENT.name });
     this.reply(link, { t: 'conversations', conversations });
+    if (!this.capabilities.rooms) return;
+    const rooms: Room[] = [];
+    for (const room of await this.refreshRooms()) {
+      const lastAgentAt = await this.lastAgentAt(room.conv);
+      rooms.push({ ...toRoom(room), ...(lastAgentAt !== undefined && { lastAgentAt }) });
+    }
+    this.reply(link, { t: 'rooms', rooms });
   }
 
   // Read from the page wizzle's history request gets, so wizzle holding that page never needs to ask again.
@@ -511,14 +583,20 @@ export class WizzleBridge {
           capabilities: this.capabilities,
         });
         await this.sendCatalog(link);
+        for (const [conv, held] of this.holds) this.reply(link, { t: 'room_hold', conv, held: [...held] });
         // Only a reply still pending is activity; a running container can sit idle for half an hour.
-        for (const conv of [...this.awaiting]) {
-          const host = await this.host.activity(conv);
+        for (const [turn, { conv, speaker }] of [...this.awaiting]) {
+          const host = await this.host.activity(conv, speaker);
           if (!host.running) continue;
-          const activity: Activity = { conv, state: host.tool ? 'tool' : 'thinking', ...(host.tool && { tool: host.tool }) };
+          const activity: Activity = {
+            conv,
+            state: host.tool ? 'tool' : 'thinking',
+            ...(host.tool && { tool: host.tool }),
+            ...(speaker !== undefined && { speaker }),
+          };
           this.reply(link, activity_packet(activity));
-          this.lastActivity.set(conv, JSON.stringify(activity));
-          this.armSilence(conv);
+          this.lastActivity.set(turn, JSON.stringify(activity));
+          this.armSilence(conv, speaker);
         }
         return;
       }
@@ -575,8 +653,8 @@ export class WizzleBridge {
         }
         const message: InboundText = { id: `wizzle-${randomUUID()}`, msgId, text, ...(attachments.length > 0 && { attachments }) };
         hooks.onInbound(conv, message);
-        this.awaiting.add(conv);
-        this.resetActivity(conv);
+        // A room expects only the members the message wakes, and the runtime reports those.
+        if (!this.rooms.some((r) => r.conv === conv)) this.expect(conv);
         return;
       }
       case 'upload': {
@@ -781,8 +859,7 @@ export class WizzleBridge {
             this.questionConv.delete(questionId);
             this.broadcast({ t: 'question_resolved', questionId, id: randomUUID() });
           }
-          this.awaiting.delete(conv);
-          this.resetActivity(conv);
+          this.settle(conv);
           this.broadcast({ t: 'conversation_deleted', conv, id: randomUUID() });
           await this.broadcastCatalog();
         } catch (err) {
@@ -815,8 +892,7 @@ export class WizzleBridge {
             this.questionConv.delete(questionId);
             this.broadcast({ t: 'question_resolved', questionId, id: randomUUID() });
           }
-          this.awaiting.delete(conv);
-          this.resetActivity(conv);
+          this.settle(conv);
           this.broadcast({ t: 'session', conv, event: 'cleared', id: randomUUID() });
           await this.broadcastCatalog();
         } catch (err) {
@@ -835,6 +911,7 @@ export class WizzleBridge {
             const result = await this.host.pauseAgent?.(agent.id);
             this.closeQuestions(result?.questionIds ?? []);
             for (const c of this.convs) if (c.agentId === agent.id) this.settle(c.conv);
+            this.settleSpeaker(agent.id);
           } else if (header.t === 'resume_agent') {
             await this.host.resumeAgent?.(agent.id);
           } else {
@@ -869,8 +946,10 @@ export class WizzleBridge {
           const result = await this.host.deleteAgent?.(agent.id, header.removeWorkspace);
           this.closeQuestions(result?.questionIds ?? []);
           for (const c of this.convs) if (c.agentId === agent.id) this.settle(c.conv);
-          for (const [questionId, conv] of this.questionConv) {
-            if (this.convs.some((c) => c.conv === conv && c.agentId === agent.id)) this.questionConv.delete(questionId);
+          this.settleSpeaker(agent.id);
+          for (const [questionId, asked] of this.questionConv) {
+            const owned = asked.speaker === agent.id || this.convs.some((c) => c.conv === asked.conv && c.agentId === agent.id);
+            if (owned) this.questionConv.delete(questionId);
           }
           this.convs = this.convs.filter((c) => c.agentId !== agent.id);
           this.agents = this.agents.filter((a) => a.id !== agent.id);
@@ -882,6 +961,12 @@ export class WizzleBridge {
         }
         return;
       }
+      case 'create_room':
+      case 'update_room':
+      case 'delete_room':
+      case 'continue_room':
+        await this.handleRoom(link, ref, header);
+        return;
       case 'secrets':
       case 'create_secret':
       case 'update_secret':
@@ -893,13 +978,135 @@ export class WizzleBridge {
       case 'detach_secret':
         await this.handleAgentSecret(link, ref, header);
         return;
-      case 'abort':
       case 'tasks':
       case 'run_task':
+      case 'pause_task':
+      case 'resume_task':
+        await this.handleTask(link, ref, header);
+        return;
+      case 'abort':
         this.fail(link, ref, 'unsupported', `${header.t} is not supported by this runtime yet`);
         return;
       default:
         this.fail(link, ref, 'unknown', `Unknown packet type ${header.t}`);
+    }
+  }
+
+  // A room request answers the asking app with the room under its ref; every app gets the new catalog.
+  private async handleRoom(link: Link, ref: string | undefined, header: Record<string, unknown>): Promise<void> {
+    const host = this.host;
+    if (!this.capabilities.rooms || !host.createRoom || !host.updateRoom || !host.deleteRoom || !host.continueRoom) {
+      this.fail(link, ref, 'unsupported', 'Rooms are not available');
+      return;
+    }
+    const answer = async (room: HostRoom) => {
+      this.rooms = [...this.rooms.filter((r) => r.conv !== room.conv), room];
+      this.reply(link, { t: 'room', ...(ref !== undefined && { ref }), room: toRoom(room) });
+      await this.broadcastCatalog();
+    };
+    if (header.t === 'create_room') {
+      const title = roomTitle(header.title);
+      const members = title === undefined ? undefined : await this.roomMembers(link, ref, header.members);
+      if (title === undefined) this.fail(link, ref, 'bad_request', `A room title is 1 to ${ROOM_LIMITS.title} characters`);
+      if (title === undefined || members === undefined) return;
+      try {
+        await answer(await host.createRoom(title, members));
+      } catch (err) {
+        this.log.warn('wizzle: room creation failed', { err });
+        this.failHost(link, ref, err, 'create_failed', 'The room could not be created');
+      }
+      return;
+    }
+    const conv = header.conv;
+    if (typeof conv !== 'string' || !(await this.knownRoom(conv))) {
+      this.fail(link, ref, 'unknown_conv', 'No such room');
+      return;
+    }
+    try {
+      if (header.t === 'update_room') {
+        const changes: HostRoomChanges = {};
+        if (header.title !== undefined) {
+          const title = roomTitle(header.title);
+          if (title === undefined) {
+            this.fail(link, ref, 'bad_request', `A room title is 1 to ${ROOM_LIMITS.title} characters`);
+            return;
+          }
+          changes.title = title;
+        }
+        if (header.members !== undefined) {
+          const members = await this.roomMembers(link, ref, header.members);
+          if (members === undefined) return;
+          changes.members = members;
+        }
+        if (changes.title === undefined && changes.members === undefined) {
+          this.fail(link, ref, 'bad_request', 'update_room changes nothing');
+          return;
+        }
+        const before = this.rooms.find((r) => r.conv === conv)?.members ?? [];
+        const room = await host.updateRoom(conv, changes);
+        for (const gone of before) if (!room.members.includes(gone)) this.settleTurn(conv, gone);
+        await answer(room);
+      } else if (header.t === 'delete_room') {
+        const result = await host.deleteRoom(conv);
+        this.closeQuestions(result?.questionIds ?? []);
+        this.settle(conv);
+        this.holds.delete(conv);
+        this.rooms = this.rooms.filter((r) => r.conv !== conv);
+        this.broadcast({ t: 'room_deleted', conv, id: randomUUID() });
+        await this.broadcastCatalog();
+      } else {
+        await host.continueRoom(conv);
+      }
+    } catch (err) {
+      this.log.warn('wizzle: room request failed', { t: header.t, conv, err });
+      this.failHost(link, ref, err, 'room_failed', 'The room could not be changed');
+    }
+  }
+
+  // Answers wizzle itself and returns undefined when the list is refused.
+  private async roomMembers(link: Link, ref: string | undefined, value: unknown): Promise<string[] | undefined> {
+    const { minMembers, maxMembers } = ROOM_LIMITS;
+    const ids = Array.isArray(value) ? value.map(optionalText) : [];
+    const valid = Array.isArray(value) && ids.every((id) => id !== undefined && id.length <= MAX_AGENT_ID);
+    const members = [...new Set(ids as string[])];
+    if (!valid || members.length !== ids.length || members.length < minMembers || members.length > maxMembers) {
+      this.fail(link, ref, 'bad_request', `A room has ${minMembers} to ${maxMembers} different agents`);
+      return undefined;
+    }
+    if (members.includes(SYSTEM_AGENT.id)) {
+      this.fail(link, ref, 'bad_request', 'System cannot join a room');
+      return undefined;
+    }
+    const agents = await this.refreshAgents();
+    if (members.some((id) => !agents.some((a) => a.id === id))) {
+      this.fail(link, ref, 'unknown_agent', 'No such agent');
+      return undefined;
+    }
+    return members;
+  }
+
+  // Every task request answers with the whole list, so the app's copy is right after any change.
+  private async handleTask(link: Link, ref: string | undefined, header: Record<string, unknown>): Promise<void> {
+    const host = this.host;
+    if (!this.capabilities.tasks || !host.listTasks || !host.runTask || !host.pauseTask || !host.resumeTask) {
+      this.fail(link, ref, 'unsupported', 'Scheduled tasks are not available');
+      return;
+    }
+    try {
+      if (header.t !== 'tasks') {
+        const taskId = header.taskId;
+        if (typeof taskId !== 'string' || taskId.length === 0) {
+          this.fail(link, ref, 'bad_request', `${header.t} needs taskId`);
+          return;
+        }
+        if (header.t === 'run_task') await host.runTask(taskId);
+        else if (header.t === 'pause_task') await host.pauseTask(taskId);
+        else await host.resumeTask(taskId);
+      }
+      this.reply(link, { t: 'tasks', ...(ref !== undefined && { ref }), tasks: await host.listTasks() });
+    } catch (err) {
+      this.log.warn('wizzle: task request failed', { t: header.t, err });
+      this.failHost(link, ref, err, 'task_failed', header.t === 'tasks' ? 'Tasks could not be listed' : 'The task could not be changed');
     }
   }
 
@@ -1032,17 +1239,25 @@ export class WizzleBridge {
     }
   }
 
-  // A stopped agent will not finish its turn, so the conversation stops waiting on it.
+  // A stopped agent will not finish its turn, so the conversation stops waiting on it; in a room, on any member.
   private settle(conv: string): void {
-    this.awaiting.delete(conv);
+    for (const [turn, waiting] of [...this.awaiting]) if (waiting.conv === conv) this.settleTurn(conv, waiting.speaker, turn);
     this.resetActivity(conv);
   }
 
+  private settleSpeaker(agentId: string): void {
+    for (const [turn, waiting] of [...this.awaiting]) if (waiting.speaker === agentId) this.settleTurn(waiting.conv, agentId, turn);
+  }
+
+  private settleTurn(conv: string, speaker: string | undefined, turn = turnKey(conv, speaker)): void {
+    this.awaiting.delete(turn);
+    this.resetActivity(turn);
+  }
+
   private markAwaitingForQuestion(questionId: string): void {
-    const conv = this.questionConv.get(questionId);
-    if (!conv) return;
-    this.awaiting.add(conv);
-    this.resetActivity(conv);
+    const asked = this.questionConv.get(questionId);
+    if (!asked) return;
+    this.expect(asked.conv, asked.speaker);
   }
 
   private dropUpload(link: Link, uploadId: string): void {
@@ -1056,6 +1271,11 @@ export class WizzleBridge {
     const cutoff = Date.now() - UPLOAD_TTL_MS;
     for (const [id, upload] of link.uploads) if (upload.at < cutoff) this.dropUpload(link, id);
   }
+}
+
+function roomTitle(value: unknown): string | undefined {
+  const title = optionalText(value);
+  return title !== undefined && title.length <= ROOM_LIMITS.title ? title : undefined;
 }
 
 function optionalText(value: unknown): string | undefined {
@@ -1170,6 +1390,16 @@ function toConversation(conv: HostConversation): Conversation {
     ...(conv.lastAt && { lastAt: conv.lastAt }),
     ...(conv.topic && { topic: true }),
     ...(conv.createdAt && { createdAt: conv.createdAt }),
+  };
+}
+
+function toRoom(room: HostRoom): Room {
+  return {
+    id: room.conv,
+    title: room.title,
+    members: [...room.members],
+    ...(room.lastAt && { lastAt: room.lastAt }),
+    ...(room.createdAt && { createdAt: room.createdAt }),
   };
 }
 

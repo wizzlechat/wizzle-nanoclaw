@@ -12,6 +12,7 @@ import {
   type Secret,
   type SecretChanges,
   type SecretInput,
+  type Task,
 } from '../../wizzle-protocol/src/index.ts';
 import {
   SYSTEM_CONV,
@@ -20,6 +21,8 @@ import {
   type HostAgent,
   type HostConversation,
   type HostCreateAgent,
+  type HostRoom,
+  type HostRoomChanges,
   type InboundText,
 } from '../src/bridge.ts';
 import { FakeWizzle, FakeRelay, bridgeKeys, newPairing, silentLog, until } from './fake-relay.ts';
@@ -39,6 +42,15 @@ function fakeHost() {
     { id: 'g2', name: 'Ops', conv: 'wizzle:agent:g2', status: 'running', lastAt: 1700000000000 },
   ];
   const activity = { running: true, tool: 'Bash' };
+  const tasks: Task[] = [
+    { id: 'briefing-1a2b', agentId: 'g1', name: 'briefing-1a2b', schedule: '0 9 * * 1-5', enabled: true, prompt: 'Morning briefing', runs: 3, failedRuns: 0 },
+  ];
+  const ran: string[] = [];
+  const task = (taskId: string): Task => {
+    const found = tasks.find((one) => one.id === taskId);
+    if (!found) throw coded('unknown_task', `No task called "${taskId}"`);
+    return found;
+  };
   const host: BridgeHost = {
     runtime: 'test',
     runtimeVersion: '9',
@@ -71,8 +83,12 @@ function fakeHost() {
     listTemplates: async () => [
       { ref: 'sales/sdr', name: 'sdr', agentName: 'SDR', description: 'Outbound', version: '1.0.0', tasks: 2, mcpServers: 1, skills: 3 },
     ],
+    listTasks: async () => tasks.map((one) => ({ ...one })),
+    runTask: async (taskId) => void ran.push(task(taskId).id),
+    pauseTask: async (taskId) => void (task(taskId).enabled = false),
+    resumeTask: async (taskId) => void (task(taskId).enabled = true),
   };
-  return { host, agents, requests };
+  return { host, agents, requests, ran };
 }
 
 async function paired(built: { host: BridgeHost; agents: HostAgent[] } = fakeHost()) {
@@ -428,7 +444,7 @@ test('create_agent, unsupported requests, and unknown types', async () => {
     timezone: 'Europe/Lisbon',
   });
 
-  t.wizzle.send({ t: 'tasks' });
+  t.wizzle.send({ t: 'abort', conv: 'wizzle:agent:g1' });
   const unsupported = await t.wizzle.nextOf('error');
   assert.equal(unsupported.header.code, 'unsupported');
 
@@ -481,6 +497,52 @@ test('an older wizzle sending only description still gets a purpose', async () =
   await t.wizzle.nextOf('agent');
   assert.deepEqual(built.requests[0], { name: 'Scout', purpose: 'Watch the build.' });
   t.bridge.stop();
+});
+
+test('tasks are listed, each change answers with the list, and a host without the methods refuses', async () => {
+  const built = fakeHost();
+  const t = await paired(built);
+  t.wizzle.send({ t: 'sync' });
+  const hello = await t.wizzle.nextOf('hello');
+  assert.equal((hello.header.capabilities as Record<string, boolean>).tasks, true);
+  t.wizzle.send({ t: 'tasks', id: 'k1' });
+  const listed = await t.wizzle.nextOf('tasks');
+  assert.equal(listed.header.ref, 'k1');
+  assert.deepEqual(listed.header.tasks, [
+    { id: 'briefing-1a2b', agentId: 'g1', name: 'briefing-1a2b', schedule: '0 9 * * 1-5', enabled: true, prompt: 'Morning briefing', runs: 3, failedRuns: 0 },
+  ]);
+  t.wizzle.send({ t: 'pause_task', taskId: 'briefing-1a2b', id: 'k2' });
+  const paused = await t.wizzle.nextOf('tasks');
+  assert.equal(paused.header.ref, 'k2');
+  assert.equal((paused.header.tasks as Task[])[0]?.enabled, false);
+  t.wizzle.send({ t: 'resume_task', taskId: 'briefing-1a2b', id: 'k3' });
+  const resumed = await t.wizzle.nextOf('tasks');
+  assert.equal(resumed.header.ref, 'k3');
+  assert.equal((resumed.header.tasks as Task[])[0]?.enabled, true);
+  t.wizzle.send({ t: 'run_task', taskId: 'briefing-1a2b', id: 'k4' });
+  const ran = await t.wizzle.nextOf('tasks');
+  assert.equal(ran.header.ref, 'k4');
+  assert.deepEqual(built.ran, ['briefing-1a2b']);
+  t.wizzle.send({ t: 'run_task', taskId: 'gone-0000', id: 'k5' });
+  const missing = await t.wizzle.nextOf('error');
+  assert.equal(missing.header.code, 'unknown_task');
+  assert.equal(missing.header.ref, 'k5');
+  t.wizzle.send({ t: 'pause_task', id: 'k6' } as never);
+  const bare = await t.wizzle.nextOf('error');
+  assert.equal(bare.header.code, 'bad_request');
+  t.bridge.stop();
+
+  const without = fakeHost();
+  delete without.host.runTask;
+  const plain = await paired(without);
+  plain.wizzle.send({ t: 'sync' });
+  const plainHello = await plain.wizzle.nextOf('hello');
+  assert.equal((plainHello.header.capabilities as Record<string, boolean>).tasks, false);
+  plain.wizzle.send({ t: 'tasks', id: 'k7' });
+  const refused = await plain.wizzle.nextOf('error');
+  assert.equal(refused.header.code, 'unsupported');
+  assert.equal(refused.header.ref, 'k7');
+  plain.bridge.stop();
 });
 
 test('templates are listed when the host has the method and refused when it has not', async () => {
@@ -1036,5 +1098,200 @@ test('an agent\'s keys are listed, attached and detached, and a create carries t
   t.wizzle.send({ t: 'create_agent', name: 'Scout', template: 'sales/sdr', secrets: [' s1 ', 's1', 's2'] });
   await t.wizzle.nextOf('agent');
   assert.deepEqual(built.requests[0], { name: 'Scout', template: 'sales/sdr', secrets: ['s1', 's2'] });
+  t.bridge.stop();
+});
+
+const ROOM = 'wizzle:room:r1';
+
+function roomHost() {
+  const built = fakeHost();
+  const rooms: HostRoom[] = [{ conv: ROOM, title: 'Launch plan', members: ['g1', 'g2'], createdAt: 1700000002000 }];
+  const continued: string[] = [];
+  const updates: Array<{ conv: string; changes: HostRoomChanges }> = [];
+  const cleared: string[] = [];
+  const created: Array<{ title: string; members: string[] }> = [];
+  Object.assign(built.host, {
+    listRooms: async () => rooms.map((room) => ({ ...room, members: [...room.members] })),
+    createRoom: async (title: string, members: string[]) => {
+      created.push({ title, members });
+      if (title === 'Refused') throw coded('create_failed', 'The host said no');
+      const room: HostRoom = { conv: `wizzle:room:r${rooms.length + 1}`, title, members };
+      rooms.push(room);
+      return { ...room };
+    },
+    updateRoom: async (conv: string, changes: HostRoomChanges) => {
+      updates.push({ conv, changes });
+      const room = rooms.find((one) => one.conv === conv) as HostRoom;
+      if (changes.title) room.title = changes.title;
+      if (changes.members) room.members = changes.members;
+      return { ...room, members: [...room.members] };
+    },
+    deleteRoom: async (conv: string) => {
+      rooms.splice(rooms.findIndex((one) => one.conv === conv), 1);
+      return { questionIds: ['q9'] };
+    },
+    continueRoom: async (conv: string) => void continued.push(conv),
+    clearConversation: async (conv: string) => {
+      cleared.push(conv);
+      return { questionIds: [] };
+    },
+  } satisfies Partial<BridgeHost>);
+  return { ...built, rooms, continued, updates, cleared, created };
+}
+
+test('rooms are unsupported without the room methods', async () => {
+  const t = await paired();
+  t.wizzle.send({ t: 'sync' });
+  const hello = await t.wizzle.nextOf('hello');
+  assert.equal((hello.header.capabilities as Record<string, boolean>).rooms, false);
+  t.wizzle.send({ t: 'create_room', title: 'Ops', members: ['g1', 'g2'], id: 'c1' });
+  const refused = await t.wizzle.nextOf('error');
+  assert.equal(refused.header.code, 'unsupported');
+  assert.equal(refused.header.ref, 'c1');
+  t.bridge.stop();
+});
+
+test('a room host lists its rooms after the conversations', async () => {
+  const built = roomHost();
+  built.host.history = async (conv) => ({
+    messages: conv === ROOM ? [{ conv, msgId: 'a1', role: 'agent', text: 'hi', format: 'markdown', at: 5000, speaker: 'g2' }] : [],
+    hasMore: false,
+  });
+  const t = await paired(built);
+  t.wizzle.send({ t: 'sync' });
+  const hello = await t.wizzle.nextOf('hello');
+  assert.equal((hello.header.capabilities as Record<string, boolean>).rooms, true);
+  const conversations = await t.wizzle.nextOf('conversations');
+  assert.equal((conversations.header.conversations as Array<{ id: string }>).some((c) => c.id === ROOM), false);
+  const rooms = await t.wizzle.nextOf('rooms');
+  assert.deepEqual(rooms.header.rooms, [{ id: ROOM, title: 'Launch plan', members: ['g1', 'g2'], createdAt: 1700000002000, lastAgentAt: 5000 }]);
+  t.bridge.stop();
+});
+
+test('create_room answers with the room under its ref, then every app gets the catalog', async () => {
+  const built = roomHost();
+  const t = await paired(built);
+  t.wizzle.send({ t: 'create_room', title: ' Ops ', members: ['g2', 'g1'], id: 'c1' });
+  const room = await t.wizzle.nextOf('room');
+  assert.equal(room.header.ref, 'c1');
+  assert.deepEqual(room.header.room, { id: 'wizzle:room:r2', title: 'Ops', members: ['g2', 'g1'] });
+  const rooms = await t.wizzle.nextOf('rooms');
+  assert.deepEqual((rooms.header.rooms as Array<{ id: string }>).map((r) => r.id), [ROOM, 'wizzle:room:r2']);
+  assert.deepEqual(built.created, [{ title: 'Ops', members: ['g2', 'g1'] }]);
+  t.bridge.stop();
+});
+
+test('room requests are validated before the host is called, and host codes come back with the ref', async () => {
+  const built = roomHost();
+  const t = await paired(built);
+  const refusal = async (packet: WizzleMessage & { id: string }) => {
+    t.wizzle.send(packet);
+    const error = await t.wizzle.nextOf('error');
+    assert.equal(error.header.ref, packet.id);
+    return error.header.code;
+  };
+  assert.equal(await refusal({ t: 'create_room', title: 'Ops', members: ['g1'], id: 'a' }), 'bad_request');
+  assert.equal(await refusal({ t: 'create_room', title: 'Ops', members: ['g1', 'g1'], id: 'b' }), 'bad_request');
+  assert.equal(await refusal({ t: 'create_room', title: 'Ops', members: ['g1', 'system'], id: 'c' }), 'bad_request');
+  assert.equal(await refusal({ t: 'create_room', title: 'Ops', members: ['g1', 'g9'], id: 'd' }), 'unknown_agent');
+  assert.equal(await refusal({ t: 'create_room', title: '  ', members: ['g1', 'g2'], id: 'e' }), 'bad_request');
+  assert.equal(await refusal({ t: 'create_room', title: 'x'.repeat(61), members: ['g1', 'g2'], id: 'f' }), 'bad_request');
+  assert.equal(await refusal({ t: 'create_room', title: 'Ops', members: Array.from({ length: 9 }, (_, i) => `g${i}`), id: 'g' }), 'bad_request');
+  assert.deepEqual(built.created, []);
+  assert.equal(await refusal({ t: 'create_room', title: 'Refused', members: ['g1', 'g2'], id: 'h' }), 'create_failed');
+  assert.equal(await refusal({ t: 'update_room', conv: 'wizzle:room:nope', title: 'X', id: 'i' }), 'unknown_conv');
+  assert.equal(await refusal({ t: 'update_room', conv: ROOM, id: 'j' }), 'bad_request');
+  assert.equal(await refusal({ t: 'update_room', conv: ROOM, members: ['g1'], id: 'k' }), 'bad_request');
+  assert.equal(await refusal({ t: 'delete_room', conv: 'wizzle:agent:g1', id: 'l' }), 'unknown_conv');
+  assert.equal(await refusal({ t: 'continue_room', conv: 'wizzle:room:nope', id: 'm' }), 'unknown_conv');
+  assert.deepEqual(built.updates, []);
+  t.bridge.stop();
+});
+
+test('update, continue, clear and delete reach the host for a room', async () => {
+  const built = roomHost();
+  const t = await paired(built);
+  t.wizzle.send({ t: 'update_room', conv: ROOM, title: 'Launch', id: 'u1' });
+  const renamed = await t.wizzle.nextOf('room');
+  assert.equal(renamed.header.ref, 'u1');
+  assert.equal((renamed.header.room as { title: string }).title, 'Launch');
+  t.wizzle.send({ t: 'update_room', conv: ROOM, members: ['g1', 'g2', 'g2'], id: 'u2' });
+  assert.equal((await t.wizzle.nextOf('error')).header.code, 'bad_request');
+  assert.deepEqual(built.updates, [{ conv: ROOM, changes: { title: 'Launch' } }]);
+
+  t.wizzle.send({ t: 'continue_room', conv: ROOM });
+  await until(() => built.continued.length === 1);
+  assert.deepEqual(built.continued, [ROOM]);
+
+  t.wizzle.send({ t: 'clear', conv: ROOM });
+  const session = await t.wizzle.nextOf('session');
+  assert.equal(session.header.conv, ROOM);
+  assert.equal(session.header.event, 'cleared');
+  assert.deepEqual(built.cleared, [ROOM]);
+
+  t.wizzle.send({ t: 'delete_room', conv: ROOM });
+  const resolved = await t.wizzle.nextOf('question_resolved');
+  assert.equal(resolved.header.questionId, 'q9');
+  const deleted = await t.wizzle.nextOf('room_deleted');
+  assert.equal(deleted.header.conv, ROOM);
+  const rooms = await t.wizzle.nextOf('rooms');
+  assert.deepEqual(rooms.header.rooms, []);
+  t.bridge.stop();
+});
+
+test('a send to a room reaches the runtime, and only a woken member\'s typing shows, under its speaker', async () => {
+  const built = roomHost();
+  built.host.activity = async (_conv, speaker) => (speaker === 'g2' ? { running: true, tool: 'Bash' } : { running: false });
+  const t = await paired(built);
+  t.wizzle.send({ t: 'send', conv: ROOM, msgId: 'p1', text: '@Ops go' });
+  await until(() => t.inbound.length === 1);
+  assert.equal(t.inbound[0]?.conv, ROOM);
+  await t.bridge.typing(ROOM, undefined, undefined, 'g2');
+  await t.bridge.typing(ROOM);
+  t.bridge.expect(ROOM, 'g2');
+  await t.bridge.typing(ROOM, undefined, undefined, 'g2');
+  const activity = await t.wizzle.nextOf('activity');
+  assert.deepEqual(activity.header.activity, { conv: ROOM, state: 'tool', tool: 'Bash', speaker: 'g2' });
+  await t.bridge.deliver(ROOM, { kind: 'chat', content: { text: 'done' }, id: 'out-1', speaker: 'g2' });
+  const message = await t.wizzle.nextOf('message');
+  assert.deepEqual(message.header.message, { conv: ROOM, msgId: 'out-1', role: 'agent', text: 'done', format: 'markdown', at: (message.header.message as { at: number }).at, speaker: 'g2' });
+  const idle = await t.wizzle.nextOf('activity');
+  assert.deepEqual(idle.header.activity, { conv: ROOM, state: 'idle', speaker: 'g2' });
+  await t.bridge.typing(ROOM, undefined, undefined, 'g2');
+  assert.equal(t.wizzle.received.length, 0);
+  t.bridge.stop();
+});
+
+test('room output carries its speaker on files, cards and questions', async () => {
+  const t = await paired(roomHost());
+  await t.bridge.deliver(ROOM, { kind: 'chat', content: { text: 'see file' }, id: 'o1', speaker: 'g1', files: [{ filename: 'a.pdf', data: utf8('pdf') }] });
+  assert.equal(((await t.wizzle.nextOf('message')).header.message as { speaker?: string }).speaker, 'g1');
+  const file = await t.wizzle.nextOf('file');
+  assert.equal(file.header.speaker, 'g1');
+  assert.equal(file.header.msgId, 'o1:f0');
+  await t.bridge.deliver(ROOM, { kind: 'chat', content: { card: { type: 'card' }, fallbackText: 'card' }, id: 'o2', speaker: 'g2' });
+  assert.equal((await t.wizzle.nextOf('card')).header.speaker, 'g2');
+  await t.bridge.deliver(ROOM, { kind: 'chat', content: { type: 'ask_question', questionId: 'q1' }, speaker: 'g2' });
+  const question = await t.wizzle.nextOf('question');
+  assert.equal((question.header.question as { speaker?: string }).speaker, 'g2');
+  await t.bridge.deliver(ROOM, { kind: 'chat', content: { operation: 'edit', messageId: 'o2', text: 'fixed' }, speaker: 'g2' });
+  assert.equal((await t.wizzle.nextOf('edit')).header.speaker, 'g2');
+  t.bridge.stop();
+});
+
+test('a room hold reaches wizzle, is replayed on sync, and an empty list clears it once', async () => {
+  const t = await paired(roomHost());
+  t.bridge.holdRoom(ROOM, ['g2']);
+  assert.deepEqual((await t.wizzle.nextOf('room_hold')).header.held, ['g2']);
+  t.wizzle.send({ t: 'sync' });
+  await t.wizzle.nextOf('rooms');
+  const replay = await t.wizzle.next();
+  assert.equal(replay.header.t, 'room_hold');
+  assert.deepEqual(replay.header.held, ['g2']);
+  t.bridge.holdRoom(ROOM, []);
+  assert.deepEqual((await t.wizzle.nextOf('room_hold')).header.held, []);
+  t.bridge.holdRoom(ROOM, []);
+  t.bridge.notify(ROOM, 'after the hold');
+  assert.equal((await t.wizzle.next()).header.t, 'message');
   t.bridge.stop();
 });

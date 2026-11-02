@@ -1,4 +1,5 @@
 import type { ChatMessage, ChatRole } from '../../wizzle-protocol/src/index.ts';
+import { AGENT_SENDER_PREFIX, NOTE_FIELD, mergeRoomMessages } from './rooms.ts';
 
 // One mailbox row as the runtime's history readers return it.
 export type MailboxRow = { id: string; timestamp: string; kind: string; content: string };
@@ -7,7 +8,7 @@ export type MailboxRow = { id: string; timestamp: string; kind: string; content:
 const ECHO_MARK = ':echo:';
 const TASK_DELIVERY = 'task-delivery';
 
-type RowContent = { text: string; senderId?: string; msgId?: string; operation?: string; echo?: string };
+type RowContent = { text: string; senderId?: string; msgId?: string; operation?: string; echo?: string; note?: string };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -36,6 +37,7 @@ function rowContent(content: string): RowContent | null {
     ...(typeof parsed.msgId === 'string' && { msgId: parsed.msgId }),
     ...(typeof parsed.operation === 'string' && { operation: parsed.operation }),
     ...(isRecord(parsed.echo) && { echo: typeof parsed.echo.surface === 'string' ? parsed.echo.surface : '' }),
+    ...(typeof parsed[NOTE_FIELD] === 'string' && { note: parsed[NOTE_FIELD] }),
   };
 }
 
@@ -72,7 +74,7 @@ export function historyMessages(
     if (row.kind !== 'chat' && row.kind !== 'chat-sdk') continue;
     const content = rowContent(row.content);
     const at = parseTimestamp(row.timestamp);
-    if (!content || at === undefined) continue;
+    if (!content || content.note !== undefined || at === undefined) continue;
     if (content.echo !== undefined) {
       const origin = echoOrigin(row.id);
       if (content.echo !== TASK_DELIVERY || !origin) continue;
@@ -97,4 +99,42 @@ export function historyMessages(
   }
   messages.sort((a, b) => a.at - b.at);
   return messages;
+}
+
+// One member's room session: what it was sent and what it said.
+export type RoomSessionRows = {
+  agentGroupId: string;
+  inbound: MailboxRow[];
+  outbound: MailboxRow[];
+  delivered: ReadonlyMap<string, MailboxRow>;
+};
+
+// A member's own copy of what it said wins over the copies the others were sent; archived rows fill in the rest.
+export function roomHistoryMessages(conv: string, sessions: RoomSessionRows[], archived: ChatMessage[], max: number): ChatMessage[] {
+  const own: ChatMessage[] = [];
+  const copies: ChatMessage[] = [];
+  for (const session of sessions) {
+    for (const message of historyMessages(conv, [], session.outbound, session.delivered)) {
+      own.push({ ...message, speaker: session.agentGroupId });
+    }
+    for (const row of session.inbound) {
+      if (row.kind !== 'chat' && row.kind !== 'chat-sdk') continue;
+      const content = rowContent(row.content);
+      const at = parseTimestamp(row.timestamp);
+      if (!content || content.note !== undefined || at === undefined) continue;
+      if (content.echo !== undefined) {
+        for (const message of historyMessages(conv, [row], [], session.delivered)) own.push({ ...message, speaker: session.agentGroupId });
+        continue;
+      }
+      const msgId = content.msgId ?? historyId(row, `in-${row.timestamp}-${copies.length}`);
+      const senderId = content.senderId ?? '';
+      if (senderId.startsWith(AGENT_SENDER_PREFIX)) {
+        const speaker = senderId.slice(AGENT_SENDER_PREFIX.length);
+        copies.push({ conv, msgId, role: 'agent', text: content.text, format: 'markdown', at, ...(speaker.length > 0 && { speaker }) });
+        continue;
+      }
+      copies.push({ conv, msgId, role: senderId === 'system' ? 'system' : 'user', text: content.text, format: 'text', at });
+    }
+  }
+  return mergeRoomMessages([own, copies, archived], max);
 }

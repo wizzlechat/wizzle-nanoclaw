@@ -5,3 +5,4 @@ export * from './transport.ts';
 export * from './qr.ts';
 export * from './pairing.ts';
 export * from './history.ts';
+export * from './rooms.ts';

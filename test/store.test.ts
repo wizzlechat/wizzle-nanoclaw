@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { BridgeStore } from '../src/store.ts';
+import { BridgeStore, ROOM_ARCHIVE_MAX } from '../src/store.ts';
 
 const RECORD = { relay: 'wss://r', pairingId: 'abc', secret: 'def', bridgePublic: 'pub', bridgePrivate: 'priv', expiresAt: 1_900_000_000, createdAt: '2026-01-01T00:00:00.000Z' };
 
@@ -71,4 +71,27 @@ test('invite text is kept until cleared', () => {
   store.saveInvite('again\n');
   store.clear();
   assert.equal(fs.existsSync(store.inviteFile), false);
+});
+
+test('a room archive round trips, keeps the newest messages and goes with its room', () => {
+  const store = tempStore();
+  assert.deepEqual(store.loadRoomArchive('r1'), []);
+  const messages = Array.from({ length: ROOM_ARCHIVE_MAX + 5 }, (_, i) => ({
+    conv: 'wizzle:room:r1',
+    msgId: `m${i}`,
+    role: 'agent' as const,
+    text: `said ${i}`,
+    format: 'markdown' as const,
+    at: i,
+    speaker: 'g3',
+  }));
+  store.saveRoomArchive('r1', messages);
+  const loaded = store.loadRoomArchive('r1');
+  assert.equal(loaded.length, ROOM_ARCHIVE_MAX);
+  assert.equal(loaded[0]?.msgId, 'm5');
+  assert.equal(fs.statSync(path.join(store.dir, 'rooms', 'r1.json')).mode & 0o777, 0o600);
+  store.dropRoomArchive('r1');
+  assert.deepEqual(store.loadRoomArchive('r1'), []);
+  store.dropRoomArchive('r1');
+  assert.throws(() => store.loadRoomArchive('../pairing'), /bad room id/);
 });

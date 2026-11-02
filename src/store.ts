@@ -1,7 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import type { SessionState } from '../../wizzle-protocol/src/index.ts';
+import type { ChatMessage, SessionState } from '../../wizzle-protocol/src/index.ts';
+
+// The most messages a room keeps from members that left it.
+export const ROOM_ARCHIVE_MAX = 2000;
+const ROOM_FILE = /^[a-z0-9]{1,32}$/;
 
 // Byte fields are base64url. expiresAt is the invite's unix seconds; wizzleKey is set once wizzle is pinned.
 export type StoredPairing = {
@@ -107,5 +111,24 @@ export class BridgeStore {
 
   clear(): void {
     for (const file of [this.pairingFile, this.sessionFile, this.inviteFile]) removeFile(file);
+  }
+
+  private roomFile(roomId: string): string {
+    if (!ROOM_FILE.test(roomId)) throw new Error(`bad room id ${roomId}`);
+    return path.join(this.dir, 'rooms', `${roomId}.json`);
+  }
+
+  // What members that left a room said there, kept so the room's history still shows it.
+  loadRoomArchive(roomId: string): ChatMessage[] {
+    const stored = readJson<{ messages?: unknown }>(this.roomFile(roomId));
+    return Array.isArray(stored?.messages) ? (stored.messages as ChatMessage[]) : [];
+  }
+
+  saveRoomArchive(roomId: string, messages: ChatMessage[]): void {
+    writeJson(this.roomFile(roomId), { messages: messages.slice(-ROOM_ARCHIVE_MAX) });
+  }
+
+  dropRoomArchive(roomId: string): void {
+    removeFile(this.roomFile(roomId));
   }
 }
