@@ -182,13 +182,13 @@ test('relay urls must be wss unless the relay is on this machine', () => {
   assert.ok(isRelayUrl('wss://relay.example.com:8443/ws'));
   assert.ok(isRelayUrl('ws://127.0.0.1:7373'));
   assert.ok(isRelayUrl('ws://localhost:7373'));
-  assert.ok(!isRelayUrl('ws://192.168.1.84:7373'));
+  assert.ok(!isRelayUrl('ws://192.0.2.10:7373'));
   assert.ok(!isRelayUrl('https://relay.example.com'));
   assert.ok(!isRelayUrl('not a url'));
 });
 
 test('a real invite fits the terminal QR code', () => {
-  const t = setup({ relay: DEFAULT_RELAY_URL, name: 'a8784661' });
+  const t = setup({ relay: DEFAULT_RELAY_URL, name: '3f9c0d2e' });
   const issued = t.manager.issue(false);
   assert.doesNotThrow(() => encodeQr(issued.url, { level: 'L' }));
   const text = inviteText(issued.url, issued.expiresAt);
