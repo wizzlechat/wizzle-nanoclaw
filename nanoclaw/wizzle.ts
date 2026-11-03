@@ -1,5 +1,6 @@
 // wizzle channel: the wizzle app paired to this NanoClaw install through the wizzle relay.
-// Lives at src/channels/wizzle.ts in the fork; the core sits in src/channels/wizzle/.
+// Installed at src/channels/wizzle.ts in NanoClaw; the core sits in src/channels/wizzle-adapter/.
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -121,6 +122,11 @@ const RESERVED_AGENT_NAMES = new Set(['system']);
 const SYSTEM_AGENT_ID = 'system';
 const ONECLI_TIMEOUT_MS = 10_000;
 const SECRET_TYPES: SecretType[] = ['generic', 'anthropic', 'openai'];
+const PROJECT_ROOT = path.dirname(DATA_DIR);
+const VERSION_FILE = path.join(PROJECT_ROOT, '.claude', 'skills', 'add-wizzle', 'VERSION');
+const UPDATE_LOG = path.join(DATA_DIR, 'wizzle', 'update.log');
+const UPDATE_RESULT = path.join(DATA_DIR, 'wizzle', 'update-result.json');
+const DEFAULT_INSTALL_URL = 'https://wizzle.app/install.sh';
 
 const WIZZLE_DEFAULTS: ChannelDefaults = {
   dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'public' },
@@ -1193,6 +1199,7 @@ export async function createAgent(request: HostCreateAgent, notify: Notify): Pro
 export function createHost(notify: Notify, rooms?: RoomDeps): BridgeHost {
   return {
     runtime: 'nanoclaw',
+    bridgeVersion: installedVersion(),
     hostName: INSTALL_SLUG,
 
     async listAgents(): Promise<HostAgent[]> {
@@ -1450,6 +1457,34 @@ export function createHost(notify: Notify, rooms?: RoomDeps): BridgeHost {
       }
       return { questionIds };
     },
+
+    // wizzle.sh backs up what it changes, installs the latest bundle, rebuilds and restarts this host.
+    async updateBridge(ended): Promise<void> {
+      fs.mkdirSync(path.dirname(UPDATE_LOG), { recursive: true });
+      fs.rmSync(UPDATE_RESULT, { force: true });
+      const out = fs.openSync(UPDATE_LOG, 'a');
+      const child = spawn('bash', ['-lc', 'curl -fsSL "$WIZZLE_INSTALL_URL" | bash -s -- --dir "$WIZZLE_NANOCLAW_DIR" --yes'], {
+        cwd: PROJECT_ROOT,
+        env: {
+          ...process.env,
+          WIZZLE_INSTALL_URL: envValue('WIZZLE_INSTALL_URL') ?? DEFAULT_INSTALL_URL,
+          WIZZLE_NANOCLAW_DIR: PROJECT_ROOT,
+          PATH: [path.dirname(process.execPath), process.env.PATH].filter(Boolean).join(path.delimiter),
+        },
+        // Its own process group, so the host restart it runs does not take it down with the host.
+        detached: true,
+        stdio: ['ignore', out, out],
+      });
+      fs.closeSync(out);
+      await new Promise<void>((resolve, reject) => {
+        child.once('spawn', resolve);
+        child.once('error', reject);
+      });
+      child.unref();
+      child.once('exit', (code, signal) => {
+        ended(takeUpdateResult() ?? `The Wizzle update stopped (${signal ?? `exit ${code}`}) without a result. Its log is ${UPDATE_LOG}.`);
+      });
+    },
   };
 }
 
@@ -1472,6 +1507,32 @@ function moveAside(dir: string, stamp: string): void {
 
 function envValue(name: string): string | undefined {
   return process.env[name] ?? readEnvFile([name])[name];
+}
+
+function installedVersion(): string {
+  try {
+    return fs.readFileSync(VERSION_FILE, 'utf8').trim() || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+// What the install script left for the app, taken so it is shown once.
+function takeUpdateResult(): string | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(UPDATE_RESULT, 'utf8');
+  } catch {
+    return null;
+  }
+  fs.rmSync(UPDATE_RESULT, { force: true });
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (isRecord(parsed) && typeof parsed.message === 'string') return parsed.message;
+  } catch {
+    // Reported below as unreadable.
+  }
+  return `The Wizzle update left an unreadable result. Its log is ${UPDATE_LOG}.`;
 }
 
 function relayUrl(): string | null {
@@ -1597,6 +1658,8 @@ function createAdapter(): ChannelAdapter | null {
         },
       };
       bridge.start(hooks);
+      const outcome = takeUpdateResult();
+      if (outcome !== null) bridge.notify(SYSTEM_CONV, outcome);
       log.info('wizzle: channel started', { relay, pairing: manager.state });
     },
 

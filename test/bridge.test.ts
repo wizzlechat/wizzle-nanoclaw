@@ -54,6 +54,7 @@ function fakeHost() {
   const host: BridgeHost = {
     runtime: 'test',
     runtimeVersion: '9',
+    bridgeVersion: '0.1.0',
     hostName: 'box',
     listAgents: async () => [...agents],
     history: async (conv, limit) => ({
@@ -1293,5 +1294,69 @@ test('a room hold reaches wizzle, is replayed on sync, and an empty list clears 
   t.bridge.holdRoom(ROOM, []);
   t.bridge.notify(ROOM, 'after the hold');
   assert.equal((await t.wizzle.next()).header.t, 'message');
+  t.bridge.stop();
+});
+
+test('the hello carries the host bridge version, and update_bridge is refused without the host method', async () => {
+  const t = await paired();
+  t.wizzle.send({ t: 'sync' });
+  const hello = await t.wizzle.nextOf('hello');
+  assert.equal(hello.header.bridgeVersion, '0.1.0');
+  assert.equal((hello.header.capabilities as Record<string, boolean>).updateBridge, false);
+  t.wizzle.send({ t: 'update_bridge', id: 'u1' });
+  const refused = await t.wizzle.nextOf('error');
+  assert.equal(refused.header.code, 'unsupported');
+  assert.equal(refused.header.ref, 'u1');
+  t.bridge.stop();
+});
+
+test('update_bridge runs one update at a time, reports a stop in the System conversation, and passes host codes back', async () => {
+  const built = fakeHost();
+  const update = { ended: null as ((message: string) => void) | null, starts: 0 };
+  const host: BridgeHost = {
+    ...built.host,
+    updateBridge: async (ended) => {
+      update.starts += 1;
+      if (update.starts === 3) throw coded('update_failed', 'pnpm is not installed');
+      update.ended = ended;
+    },
+  };
+  const t = await paired({ host, agents: built.agents });
+  t.wizzle.send({ t: 'sync' });
+  assert.equal(((await t.wizzle.nextOf('hello')).header.capabilities as Record<string, boolean>).updateBridge, true);
+
+  t.wizzle.send({ t: 'update_bridge', id: 'u1' });
+  const started = await t.wizzle.nextOf('bridge_update');
+  assert.equal(started.header.status, 'started');
+  assert.equal(started.header.ref, 'u1');
+  t.wizzle.send({ t: 'update_bridge', id: 'u2' });
+  const busy = await t.wizzle.nextOf('error');
+  assert.equal(busy.header.code, 'busy');
+  assert.equal(busy.header.ref, 'u2');
+
+  const outcome = 'Wizzle update failed: the build fails. The files were put back from the backup.';
+  update.ended?.(outcome);
+  const notice = await t.wizzle.nextOf('message');
+  const row = notice.header.message as { conv: string; role: string; text: string };
+  assert.equal(row.conv, SYSTEM_CONV);
+  assert.equal(row.role, 'system');
+  assert.equal(row.text, outcome);
+  const failed = await t.wizzle.nextOf('bridge_update');
+  assert.equal(failed.header.status, 'failed');
+  assert.equal(failed.header.message, outcome);
+  assert.equal('ref' in failed.header, false);
+
+  t.wizzle.send({ t: 'update_bridge', id: 'u3' });
+  assert.equal((await t.wizzle.nextOf('bridge_update')).header.status, 'started');
+  update.ended?.('stopped');
+  await t.wizzle.nextOf('bridge_update');
+  t.wizzle.send({ t: 'update_bridge', id: 'u4' });
+  const notStarted = await t.wizzle.nextOf('error');
+  assert.equal(notStarted.header.code, 'update_failed');
+  assert.equal(notStarted.header.message, 'pnpm is not installed');
+  assert.equal(notStarted.header.ref, 'u4');
+  t.wizzle.send({ t: 'update_bridge', id: 'u5' });
+  assert.equal((await t.wizzle.nextOf('bridge_update')).header.ref, 'u5');
+  assert.equal(update.starts, 4);
   t.bridge.stop();
 });

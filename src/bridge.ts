@@ -29,7 +29,6 @@ import {
 import { RelayClient, type Logger } from './relay-client.ts';
 import type { Transport } from './transport.ts';
 
-export const BRIDGE_VERSION = '0.1.0';
 export const SYSTEM_CONV = 'wizzle:system';
 export const SYSTEM_AGENT: Agent = { id: 'system', name: 'System', status: 'idle', description: 'Approvals and host notices' };
 
@@ -68,6 +67,8 @@ export type HostCreateAgent = { name: string; purpose?: string; template?: strin
 export interface BridgeHost {
   readonly runtime: string;
   readonly runtimeVersion?: string;
+  // The installed bundle version, what the install script wrote.
+  readonly bridgeVersion: string;
   readonly hostName: string;
   listAgents(): Promise<HostAgent[]>;
   history(conv: string, limit: number): Promise<HostHistory>;
@@ -106,6 +107,8 @@ export interface BridgeHost {
   updateRoom?(conv: string, changes: HostRoomChanges): Promise<HostRoom>;
   deleteRoom?(conv: string): Promise<HostDeleted | void>;
   continueRoom?(conv: string): Promise<void>;
+  // Starts the install script in the background; ended runs if it stops without restarting the host.
+  updateBridge?(ended: (message: string) => void): Promise<void>;
 }
 
 export type InboundAttachment = { name: string; mimeType: string; size: number; data: string };
@@ -185,6 +188,7 @@ export class WizzleBridge {
   private convs: HostConversation[] = [];
   private rooms: HostRoom[] = [];
   private hooks: BridgeHooks | null = null;
+  private updating = false;
   readonly capabilities: Capabilities;
 
   constructor(opts: { host: BridgeHost; log: Logger; capabilities?: Partial<Capabilities> }) {
@@ -223,6 +227,7 @@ export class WizzleBridge {
       rooms: [opts.host.listRooms, opts.host.createRoom, opts.host.updateRoom, opts.host.deleteRoom, opts.host.continueRoom, opts.host.clearConversation].every(
         (method) => typeof method === 'function',
       ),
+      updateBridge: typeof opts.host.updateBridge === 'function',
       ...opts.capabilities,
     };
   }
@@ -578,7 +583,7 @@ export class WizzleBridge {
           protocol: PROTOCOL_VERSION,
           runtime: this.host.runtime,
           ...(this.host.runtimeVersion && { runtimeVersion: this.host.runtimeVersion }),
-          bridgeVersion: BRIDGE_VERSION,
+          bridgeVersion: this.host.bridgeVersion,
           host: this.host.hostName,
           capabilities: this.capabilities,
         });
@@ -984,6 +989,31 @@ export class WizzleBridge {
       case 'resume_task':
         await this.handleTask(link, ref, header);
         return;
+      case 'update_bridge': {
+        if (!this.capabilities.updateBridge || !this.host.updateBridge) {
+          this.fail(link, ref, 'unsupported', 'This runtime cannot update the bridge from wizzle');
+          return;
+        }
+        if (this.updating) {
+          this.fail(link, ref, 'busy', 'A bridge update is already running');
+          return;
+        }
+        this.updating = true;
+        try {
+          await this.host.updateBridge((message) => {
+            this.updating = false;
+            this.notify(SYSTEM_CONV, message);
+            this.broadcast({ t: 'bridge_update', status: 'failed', message, id: randomUUID() });
+          });
+        } catch (err) {
+          this.updating = false;
+          this.log.warn('wizzle: bridge update did not start', { err });
+          this.failHost(link, ref, err, 'update_failed', 'The bridge update could not start');
+          return;
+        }
+        this.reply(link, { t: 'bridge_update', ...(ref !== undefined && { ref }), status: 'started' });
+        return;
+      }
       case 'abort':
         this.fail(link, ref, 'unsupported', `${header.t} is not supported by this runtime yet`);
         return;
